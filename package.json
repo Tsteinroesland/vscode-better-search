@@ -1,0 +1,75 @@
+{
+  "name": "betterfilesearch",
+  "displayName": "BetterFileSearch",
+  "description": "A better way to search files in your workspace.",
+  "version": "0.0.1",
+  "publisher": "your-publisher-id",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "betterFileSearch.search",
+        "title": "Better File Search: Search Files"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "betterFileSearch.search",
+        "key": "ctrl+alt+f",
+        "mac": "cmd+alt+f"
+      }
+    ],
+    "configuration": {
+      "title": "BetterFileSearch",
+      "properties": {
+        "betterFileSearch.maxResults": {
+          "type": "number",
+          "default": 50,
+          "description": "Maximum number of results to show."
+        },
+        "betterFileSearch.excludeGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/.venv/**",
+            "**/venv/**",
+            "**/__pycache__/**"
+          ],
+          "markdownDescription": "Glob patterns to exclude from search. Patterns are matched against file paths relative to the workspace root (e.g. `**/.venv/**`)."
+        },
+        "betterFileSearch.useWorkspaceExcludes": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Also honor the paths you've already hidden via the built-in `files.exclude` and `search.exclude` settings, in addition to `#betterFileSearch.excludeGlobs#`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "tsc -p ./",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.x",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.x",
+    "@typescript-eslint/parser": "^7.x",
+    "eslint": "^8.x",
+    "typescript": "^5.4.0"
+  }
+}
