@@ -1,9 +1,18 @@
 {
-  "name": "betterfilesearch",
+  "name": "vscode-better-search",
   "displayName": "BetterFileSearch",
   "description": "A better way to search files in your workspace.",
   "version": "0.0.1",
-  "publisher": "your-publisher-id",
+  "publisher": "Tsteinroesland",
+  "author": "Torstein Røsland",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tsteinroesland/vscode-better-search.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Tsteinroesland/vscode-better-search/issues"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
