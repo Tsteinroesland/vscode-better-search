@@ -26,6 +26,10 @@
       {
         "command": "betterFileSearch.search",
         "title": "Better File Search: Search Files"
+      },
+      {
+        "command": "betterFileSearch.toggleIgnored",
+        "title": "Better File Search: Toggle Gitignored Files"
       }
     ],
     "keybindings": [
@@ -33,6 +37,11 @@
         "command": "betterFileSearch.search",
         "key": "ctrl+alt+f",
         "mac": "cmd+alt+f"
+      },
+      {
+        "command": "betterFileSearch.toggleIgnored",
+        "key": "ctrl+h",
+        "when": "betterFileSearch.searchActive"
       }
     ],
     "configuration": {
@@ -80,5 +89,8 @@
     "@typescript-eslint/parser": "^7.x",
     "eslint": "^8.x",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "ignore": "^7.0.5"
   }
 }
