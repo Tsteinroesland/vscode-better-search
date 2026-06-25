@@ -7,13 +7,10 @@ import { LevvyScorer } from "./levvy";
  * the contributed commands, VS Code loads this module and calls `activate`.
  */
 export function activate(context: vscode.ExtensionContext): void {
-	const recentFiles = new RecentFiles(context);
-	recentFiles.seedFromOpenTabs();
-
 	const searchCommand = vscode.commands.registerCommand(
 		"betterFileSearch.search",
 		async () => {
-			await searchFiles(recentFiles);
+			await searchFiles();
 		},
 	);
 
@@ -26,13 +23,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		},
 	);
 
-	// Keep a most-recently-used list of files the user opens, so the search can
-	// surface them first (mirroring VS Code's own "recently opened" group).
-	const editorTracker = vscode.window.onDidChangeActiveTextEditor((editor) => {
-		recentFiles.touch(editor?.document.uri);
-	});
-
-	context.subscriptions.push(searchCommand, toggleCommand, editorTracker);
+	context.subscriptions.push(searchCommand, toggleCommand);
 }
 
 /**
@@ -51,7 +42,7 @@ interface Candidate {
  * A fuzzy file finder. Enumerates workspace files once, then re-ranks them on
  * every keystroke using the Levvy distance (lower = better match).
  */
-async function searchFiles(recentFiles: RecentFiles): Promise<void> {
+async function searchFiles(): Promise<void> {
 	const config = vscode.workspace.getConfiguration("betterFileSearch");
 	const maxResults = config.get<number>("maxResults", 50);
 	const basePatterns = buildExcludePatterns(config);
@@ -93,15 +84,9 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	// toggles ignored files on.
 	let fullLoaded = !useIgnoreGlobs;
 
-	// Recently opened files, most-recent-first. Resolved directly from disk so
-	// they still surface even when gitignored (and thus skipped by the walk
-	// above). Only files that still exist in the workspace are kept.
-	const recentCandidates = await resolveRecentCandidates(recentFiles);
-	const recentSet = new Set(recentCandidates.map((c) => c.uri.toString()));
-
 	// Longest path across all candidates. Each candidate is padded up to this
 	// length so that short paths don't get an unfair skip-cost discount.
-	let maxPathLen = computeMaxPathLen(candidates, recentCandidates);
+	let maxPathLen = computeMaxPathLen(candidates);
 
 	const scorer = new LevvyScorer();
 
@@ -146,45 +131,10 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 			.map((s) => s.c);
 
 	const rank = (query: string) => {
-		const items: Item[] = [];
-
-		// Recently opened group. With a query, only keep recents that fuzzily
-		// match it (so unrelated history drops out), then order by score.
-		let recent = recentCandidates;
-		if (query) {
-			recent = rankCandidates(
-				query,
-				recentCandidates.filter((c) => isFuzzyMatch(query, c.relPath)),
-			);
-		}
-		recent = recent.slice(0, maxResults);
-		if (recent.length > 0) {
-			items.push({
-				label: "recently opened",
-				kind: vscode.QuickPickItemKind.Separator,
-			});
-			items.push(...recent.map(toItem));
-		}
-
-		// File results group. Exclude anything already shown under "recently
-		// opened" to avoid duplicates.
-		const fileCandidates = activeCandidates.filter(
-			(c) => !recentSet.has(c.uri.toString()),
-		);
 		const results = query
-			? rankCandidates(query, fileCandidates).slice(0, maxResults)
-			: fileCandidates.slice(0, maxResults);
-		if (results.length > 0) {
-			if (items.length > 0) {
-				items.push({
-					label: "file results",
-					kind: vscode.QuickPickItemKind.Separator,
-				});
-			}
-			items.push(...results.map(toItem));
-		}
-
-		quickPick.items = items;
+			? rankCandidates(query, activeCandidates).slice(0, maxResults)
+			: activeCandidates.slice(0, maxResults);
+		quickPick.items = results.map(toItem);
 	};
 
 	const toggleIgnored = async () => {
@@ -204,7 +154,7 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 						});
 					}
 				}
-				maxPathLen = computeMaxPathLen(candidates, recentCandidates);
+				maxPathLen = computeMaxPathLen(candidates);
 			} finally {
 				quickPick.busy = false;
 			}
@@ -317,97 +267,6 @@ function addExcludePattern(patterns: Set<string>, glob: string): void {
 function basename(p: string): string {
 	const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
 	return i === -1 ? p : p.slice(i + 1);
-}
-
-/**
- * Case-insensitive subsequence test: are all characters of `query` found in
- * `text` in order? Used to decide whether a recently opened file is relevant to
- * the current query before ranking the survivors.
- */
-function isFuzzyMatch(query: string, text: string): boolean {
-	const q = query.toLowerCase();
-	const t = text.toLowerCase();
-	let qi = 0;
-	for (let ti = 0; ti < t.length && qi < q.length; ti++) {
-		if (t[ti] === q[qi]) {
-			qi++;
-		}
-	}
-	return qi === q.length;
-}
-
-/**
- * Tracks a most-recently-used list of files the user has opened, persisted in
- * workspace storage so it survives reloads. Mirrors the "recently opened" group
- * VS Code's own Quick Open shows above fresh file results.
- */
-class RecentFiles {
-	private static readonly KEY = "betterFileSearch.recentFiles";
-	private static readonly MAX = 100;
-	private order: string[];
-
-	constructor(private readonly context: vscode.ExtensionContext) {
-		this.order = context.workspaceState.get<string[]>(RecentFiles.KEY, []);
-	}
-
-	/** Records `uri` (a real on-disk file) as the most recently used. */
-	touch(uri: vscode.Uri | undefined): void {
-		if (uri?.scheme !== "file") {
-			return;
-		}
-		const key = uri.toString();
-		this.order = [key, ...this.order.filter((u) => u !== key)].slice(
-			0,
-			RecentFiles.MAX,
-		);
-		void this.context.workspaceState.update(RecentFiles.KEY, this.order);
-	}
-
-	/** Seeds the list from currently open tabs (oldest first, active last). */
-	seedFromOpenTabs(): void {
-		for (const group of vscode.window.tabGroups.all) {
-			for (const tab of group.tabs) {
-				const input = tab.input;
-				if (input instanceof vscode.TabInputText) {
-					this.touch(input.uri);
-				}
-			}
-		}
-	}
-
-	/** Returns the tracked files, most-recent-first. */
-	list(): vscode.Uri[] {
-		return this.order.map((u) => vscode.Uri.parse(u));
-	}
-}
-
-/**
- * Resolves the recently opened files directly from disk, most-recent-first.
- *
- * They are looked up by URI rather than intersected with the workspace walk, so
- * recently opened files still surface even when they are gitignored (and were
- * therefore skipped by the walk). Files that no longer exist are dropped.
- */
-async function resolveRecentCandidates(
-	recentFiles: RecentFiles,
-): Promise<Candidate[]> {
-	const resolved = await Promise.all(
-		recentFiles.list().map(async (uri) => {
-			try {
-				const stat = await vscode.workspace.fs.stat(uri);
-				if (stat.type & vscode.FileType.File) {
-					return {
-						uri,
-						relPath: vscode.workspace.asRelativePath(uri),
-					} as Candidate;
-				}
-			} catch {
-				// File no longer exists; drop it.
-			}
-			return undefined;
-		}),
-	);
-	return resolved.filter((c): c is Candidate => c !== undefined);
 }
 
 /** Longest `relPath` across the given candidate lists. */
