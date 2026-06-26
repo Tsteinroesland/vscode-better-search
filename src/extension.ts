@@ -1,5 +1,6 @@
 import ignore from "ignore";
 import * as vscode from "vscode";
+import { CosineScorer } from "./cosine";
 import { LevvyScorer } from "./levvy";
 
 /**
@@ -23,7 +24,16 @@ export function activate(context: vscode.ExtensionContext): void {
 		},
 	);
 
-	context.subscriptions.push(searchCommand, toggleCommand);
+	// Triggered by the Ctrl+Alt+H keybinding (and the QuickPick button) while a
+	// search is open. Switches the active match algorithm.
+	const toggleScorerCommand = vscode.commands.registerCommand(
+		"betterFileSearch.toggleScorer",
+		() => {
+			activeToggleScorer?.();
+		},
+	);
+
+	context.subscriptions.push(searchCommand, toggleCommand, toggleScorerCommand);
 }
 
 /**
@@ -32,6 +42,12 @@ export function activate(context: vscode.ExtensionContext): void {
  * running QuickPick without threading state through global commands.
  */
 let activeToggleIgnored: (() => void | Promise<void>) | undefined;
+
+/**
+ * Toggle callback for switching the active match algorithm of the currently
+ * open search, or `undefined` when no search is active.
+ */
+let activeToggleScorer: (() => void) | undefined;
 
 interface Candidate {
 	uri: vscode.Uri;
@@ -48,6 +64,19 @@ async function searchFiles(): Promise<void> {
 	const basePatterns = buildExcludePatterns(config);
 	const baseExclude = patternsToGlob(basePatterns);
 
+	// Create and show the picker up front so it appears instantly, even on large
+	// workspaces where enumerating files takes a moment. The spinner stays on
+	// until the candidate list is ready.
+	type Item = vscode.QuickPickItem & { uri?: vscode.Uri };
+	const quickPick = vscode.window.createQuickPick<Item>();
+	quickPick.title = "Better File Search";
+	quickPick.placeholder = "Type to fuzzy-search files by name";
+	quickPick.matchOnDescription = false;
+	// We do our own ranking, so disable the built-in QuickPick filtering.
+	(quickPick as unknown as { sortByLabel: boolean }).sortByLabel = false;
+	quickPick.busy = true;
+	quickPick.show();
+
 	// Load .gitignore rules first. When they contain no negations we can fold
 	// them into the walk's exclude glob, so VS Code skips ignored directories
 	// entirely instead of enumerating (potentially huge) ignored trees just to
@@ -63,6 +92,7 @@ async function searchFiles(): Promise<void> {
 	// this walk never descends into ignored directories.
 	const uris = await vscode.workspace.findFiles("**/*", initialExclude);
 	if (uris.length === 0 && !useIgnoreGlobs) {
+		quickPick.dispose();
 		vscode.window.showInformationMessage("No files found in the workspace.");
 		return;
 	}
@@ -88,26 +118,49 @@ async function searchFiles(): Promise<void> {
 	// length so that short paths don't get an unfair skip-cost discount.
 	let maxPathLen = computeMaxPathLen(candidates);
 
-	const scorer = new LevvyScorer();
+	// Two interchangeable match algorithms; both return a distance (lower =
+	// better). The user can switch between them via the toolbar button or the
+	// Ctrl+Alt+H keybinding.
+	const levvyScorer = new LevvyScorer();
+	const cosineScorer = new CosineScorer();
+	let useCosine = true;
+	const score = (q: string, h: string, padding: number): number =>
+		useCosine
+			? cosineScorer.score(q, h, padding)
+			: levvyScorer.score(q, h, padding);
+
+	const scorerName = () => (useCosine ? "Cosine similarity" : "Levvy distance");
+	const otherScorerName = () =>
+		useCosine ? "Levvy distance" : "Cosine similarity";
 
 	const ignoredButton: vscode.QuickInputButton = {
 		iconPath: new vscode.ThemeIcon("list-filter"),
 		tooltip: "Toggle gitignored files (Ctrl+H)",
 	};
-
-	type Item = vscode.QuickPickItem & { uri?: vscode.Uri };
-	const quickPick = vscode.window.createQuickPick<Item>();
-	quickPick.title = "Better File Search";
-	quickPick.placeholder = "Type to fuzzy-search files by name";
-	quickPick.matchOnDescription = false;
-	quickPick.buttons = [ignoredButton];
-	// We do our own ranking, so disable the built-in QuickPick filtering.
-	(quickPick as unknown as { sortByLabel: boolean }).sortByLabel = false;
+	// Rebuilt whenever the algorithm changes so its tooltip reflects the active
+	// scorer and what toggling switches to. Reassigning keeps the reference used
+	// for identity comparison in the button handler in sync.
+	let scorerButton: vscode.QuickInputButton = buildScorerButton();
+	function buildScorerButton(): vscode.QuickInputButton {
+		return {
+			iconPath: new vscode.ThemeIcon("arrow-swap"),
+			tooltip: `Match algorithm: ${scorerName()} — switch to ${otherScorerName()} (Ctrl+Alt+H)`,
+		};
+	}
+	const refreshButtons = () => {
+		scorerButton = buildScorerButton();
+		quickPick.buttons = [scorerButton, ignoredButton];
+	};
+	// The candidate list is ready; drop the loading spinner.
+	quickPick.busy = false;
 
 	const updateTitle = () => {
-		quickPick.title = includeIgnored
-			? "Better File Search (gitignored shown)"
-			: "Better File Search";
+		const parts: string[] = [scorerName()];
+		if (includeIgnored) {
+			parts.push("gitignored shown");
+		}
+		quickPick.title = `Better File Search (${parts.join(", ")})`;
+		refreshButtons();
 	};
 
 	const toItem = (c: Candidate): Item => ({
@@ -117,13 +170,13 @@ async function searchFiles(): Promise<void> {
 		alwaysShow: true,
 	});
 
-	// Orders candidates by match quality for the given query. Lower Levvy score
-	// wins; on ties, the shorter path wins.
+	// Orders candidates by match quality for the given query. Lower score wins;
+	// on ties, the shorter path wins.
 	const rankCandidates = (query: string, list: Candidate[]): Candidate[] =>
 		list
 			.map((c) => ({
 				c,
-				score: scorer.score(query, c.relPath, maxPathLen - c.relPath.length),
+				score: score(query, c.relPath, maxPathLen - c.relPath.length),
 			}))
 			.sort(
 				(a, b) => a.score - b.score || a.c.relPath.length - b.c.relPath.length,
@@ -166,11 +219,20 @@ async function searchFiles(): Promise<void> {
 		rank(quickPick.value);
 	};
 
+	const toggleScorer = () => {
+		useCosine = !useCosine;
+		updateTitle();
+		rank(quickPick.value);
+	};
+
 	rank("");
+	updateTitle();
 	quickPick.onDidChangeValue(rank);
 	quickPick.onDidTriggerButton((button) => {
 		if (button === ignoredButton) {
 			toggleIgnored();
+		} else if (button === scorerButton) {
+			toggleScorer();
 		}
 	});
 
@@ -186,6 +248,7 @@ async function searchFiles(): Promise<void> {
 	// Expose the toggle and mark the search as active so the Ctrl+H keybinding
 	// (gated on the `betterFileSearch.searchActive` context) can reach it.
 	activeToggleIgnored = toggleIgnored;
+	activeToggleScorer = toggleScorer;
 	vscode.commands.executeCommand(
 		"setContext",
 		"betterFileSearch.searchActive",
@@ -194,6 +257,7 @@ async function searchFiles(): Promise<void> {
 
 	quickPick.onDidHide(() => {
 		activeToggleIgnored = undefined;
+		activeToggleScorer = undefined;
 		vscode.commands.executeCommand(
 			"setContext",
 			"betterFileSearch.searchActive",
@@ -201,7 +265,6 @@ async function searchFiles(): Promise<void> {
 		);
 		quickPick.dispose();
 	});
-	quickPick.show();
 }
 
 /**

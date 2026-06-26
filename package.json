@@ -30,6 +30,10 @@
       {
         "command": "betterFileSearch.toggleIgnored",
         "title": "Better File Search: Toggle Gitignored Files"
+      },
+      {
+        "command": "betterFileSearch.toggleScorer",
+        "title": "Better File Search: Toggle Match Algorithm"
       }
     ],
     "keybindings": [
@@ -41,6 +45,11 @@
       {
         "command": "betterFileSearch.toggleIgnored",
         "key": "ctrl+h",
+        "when": "betterFileSearch.searchActive"
+      },
+      {
+        "command": "betterFileSearch.toggleScorer",
+        "key": "ctrl+alt+h",
         "when": "betterFileSearch.searchActive"
       }
     ],
