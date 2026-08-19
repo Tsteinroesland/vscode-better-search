@@ -33,7 +33,40 @@ export function activate(context: vscode.ExtensionContext): void {
 		},
 	);
 
-	context.subscriptions.push(searchCommand, toggleCommand, toggleScorerCommand);
+	// Invalidate the candidate cache when files are added/removed or a .gitignore
+	// changes, so a reopened search reflects the current tree. Pure content edits
+	// don't change the set of paths, so they're ignored; churn inside gitignored
+	// trees (build output, etc.) is ignored too so it doesn't keep busting the
+	// cache. VS Code's `files.watcherExclude` already keeps node_modules and the
+	// like out of these events entirely.
+	const watcher = vscode.workspace.createFileSystemWatcher("**/*");
+	const onFsEvent = (uri: vscode.Uri, contentChange: boolean): void => {
+		const cache = workspaceCache;
+		if (!cache) {
+			return;
+		}
+		if (basename(uri.path) === ".gitignore") {
+			invalidateCache();
+			return;
+		}
+		if (contentChange) {
+			return;
+		}
+		if (cache.isIgnored(cache.relativize(uri))) {
+			return;
+		}
+		invalidateCache();
+	};
+	watcher.onDidCreate((u) => onFsEvent(u, false));
+	watcher.onDidDelete((u) => onFsEvent(u, false));
+	watcher.onDidChange((u) => onFsEvent(u, true));
+
+	context.subscriptions.push(
+		searchCommand,
+		toggleCommand,
+		toggleScorerCommand,
+		watcher,
+	);
 }
 
 /**
@@ -55,14 +88,189 @@ interface Candidate {
 }
 
 /**
+ * Cached result of enumerating the workspace, reused across searches so that
+ * reopening the picker doesn't re-walk the file system. Invalidated by the file
+ * watcher in `activate`, and rebuilt when the exclude configuration or workspace
+ * folders change (tracked via `signature`).
+ */
+interface WorkspaceCache {
+	/** Identity of the config/workspace this was built for; a mismatch rebuilds. */
+	signature: string;
+	/** Exclude glob for a full (gitignore-inclusive) walk, used for lazy loading. */
+	baseExclude: vscode.GlobPattern | undefined;
+	/** Fast workspace-relative path for a URI (cheaper than `asRelativePath`). */
+	relativize: (uri: vscode.Uri) => string;
+	/** Whether a workspace-relative path is gitignored. */
+	isIgnored: (relPath: string) => boolean;
+	/** All enumerated candidates; grows to the full set via `ensureFullCandidates`. */
+	candidates: Candidate[];
+	/** Non-ignored subset — shown by default. Stable across lazy full loads. */
+	visible: Candidate[];
+	/** Longest relPath among `candidates`, for score padding. */
+	maxPathLen: number;
+	/** Whether gitignore globs were folded into the initial walk. */
+	useIgnoreGlobs: boolean;
+	/** Whether `candidates` already holds the full (gitignore-inclusive) set. */
+	fullLoaded: boolean;
+}
+
+/** Cached workspace enumeration, or `undefined` when cold/invalidated. */
+let workspaceCache: WorkspaceCache | undefined;
+/** In-flight cache build, so concurrent opens share a single walk. */
+let cacheLoading: Promise<WorkspaceCache> | undefined;
+
+/** Drops the cache so the next search re-enumerates. Called by the watcher. */
+function invalidateCache(): void {
+	workspaceCache = undefined;
+}
+
+/**
+ * Signature capturing everything that affects the candidate set: the workspace
+ * folders and the resolved exclude patterns. A change rebuilds the cache.
+ */
+function cacheSignature(basePatterns: Set<string>): string {
+	const folders = (vscode.workspace.workspaceFolders ?? []).map((f) =>
+		f.uri.toString(),
+	);
+	return JSON.stringify({ folders, patterns: [...basePatterns].sort() });
+}
+
+/**
+ * Returns the workspace enumeration, reusing the cache when its signature still
+ * matches. Concurrent callers share one in-flight build.
+ */
+async function ensureCache(
+	config: vscode.WorkspaceConfiguration,
+): Promise<WorkspaceCache> {
+	const basePatterns = buildExcludePatterns(config);
+	const signature = cacheSignature(basePatterns);
+	if (workspaceCache && workspaceCache.signature === signature) {
+		return workspaceCache;
+	}
+	if (!cacheLoading) {
+		cacheLoading = loadCandidates(basePatterns, signature)
+			.then((c) => {
+				workspaceCache = c;
+				return c;
+			})
+			.finally(() => {
+				cacheLoading = undefined;
+			});
+	}
+	return cacheLoading;
+}
+
+/**
+ * Cold-path workspace enumeration: read root .gitignore(s), fold their globs
+ * into a single recursive `findFiles` walk, pick up nested .gitignore files from
+ * the results, and build the candidate/visible lists.
+ */
+async function loadCandidates(
+	basePatterns: Set<string>,
+	signature: string,
+): Promise<WorkspaceCache> {
+	const baseExclude = patternsToGlob(basePatterns);
+	const relativize = makeRelativize();
+
+	const rootUris = rootGitignoreUris();
+	const rootGitignore = await collectGitignore(rootUris);
+
+	const useIgnoreGlobs =
+		!rootGitignore.anyNegation && rootGitignore.ignoreGlobs.length > 0;
+	const initialExclude = useIgnoreGlobs
+		? patternsToGlob(new Set([...basePatterns, ...rootGitignore.ignoreGlobs]))
+		: baseExclude;
+
+	const uris = await vscode.workspace.findFiles("**/*", initialExclude);
+
+	// Nested .gitignore files weren't pruned by the walk, so they appear in its
+	// results. Merge their rules with the root ones. Nested rules aren't folded
+	// into the walk's exclude, so they needn't be negation-free — the `ignore`
+	// matcher applies them for correctness.
+	const rootKeys = new Set(rootUris.map((u) => u.toString()));
+	const nestedUris = uris.filter(
+		(u) => basename(u.path) === ".gitignore" && !rootKeys.has(u.toString()),
+	);
+	const nestedGitignore = await collectGitignore(nestedUris);
+	const isIgnored = buildIsIgnored([
+		...rootGitignore.matchers,
+		...nestedGitignore.matchers,
+	]);
+
+	const candidates: Candidate[] = uris.map((uri) => ({
+		uri,
+		relPath: relativize(uri),
+	}));
+	const visible = candidates.filter((c) => !isIgnored(c.relPath));
+
+	return {
+		signature,
+		baseExclude,
+		relativize,
+		isIgnored,
+		candidates,
+		visible,
+		maxPathLen: computeMaxPathLen(candidates),
+		useIgnoreGlobs,
+		fullLoaded: !useIgnoreGlobs,
+	};
+}
+
+/**
+ * Loads the gitignored files that the folded initial walk skipped, appending
+ * them to `data.candidates`. Idempotent. The visible (non-ignored) set is
+ * unaffected, since every file added here is by definition gitignored.
+ */
+async function ensureFullCandidates(data: WorkspaceCache): Promise<void> {
+	if (data.fullLoaded) {
+		return;
+	}
+	data.fullLoaded = true;
+	const allUris = await vscode.workspace.findFiles("**/*", data.baseExclude);
+	const known = new Set(data.candidates.map((c) => c.uri.toString()));
+	for (const uri of allUris) {
+		if (!known.has(uri.toString())) {
+			data.candidates.push({ uri, relPath: data.relativize(uri) });
+		}
+	}
+	data.maxPathLen = computeMaxPathLen(data.candidates);
+}
+
+/**
+ * Builds a fast workspace-relative path function, mirroring
+ * `vscode.workspace.asRelativePath` but without a per-call API round-trip — a
+ * meaningful saving when mapping tens of thousands of URIs. In a multi-root
+ * workspace the folder name is prefixed, matching the built-in API's default.
+ */
+function makeRelativize(): (uri: vscode.Uri) => string {
+	const folders = vscode.workspace.workspaceFolders ?? [];
+	const multi = folders.length > 1;
+	const entries = folders.map((f) => {
+		const path = f.uri.path;
+		return { name: f.name, path, prefix: path.endsWith("/") ? path : `${path}/` };
+	});
+	return (uri: vscode.Uri): string => {
+		const p = uri.path;
+		for (const e of entries) {
+			if (p === e.path) {
+				return multi ? e.name : "";
+			}
+			if (p.startsWith(e.prefix)) {
+				const rel = p.slice(e.prefix.length);
+				return multi ? `${e.name}/${rel}` : rel;
+			}
+		}
+		return p;
+	};
+}
+
+/**
  * A fuzzy file finder. Enumerates workspace files once, then re-ranks them on
  * every keystroke using the Levvy distance (lower = better match).
  */
 async function searchFiles(): Promise<void> {
 	const config = vscode.workspace.getConfiguration("betterFileSearch");
 	const maxResults = config.get<number>("maxResults", 50);
-	const basePatterns = buildExcludePatterns(config);
-	const baseExclude = patternsToGlob(basePatterns);
 
 	// Create and show the picker up front so it appears instantly, even on large
 	// workspaces where enumerating files takes a moment. The spinner stays on
@@ -77,53 +285,31 @@ async function searchFiles(): Promise<void> {
 	quickPick.busy = true;
 	quickPick.show();
 
-	// Load .gitignore rules first. When they contain no negations we can fold
-	// them into the walk's exclude glob, so VS Code skips ignored directories
-	// entirely instead of enumerating (potentially huge) ignored trees just to
-	// discard them afterwards.
-	const gitignore = await buildGitignore(baseExclude);
-	const useIgnoreGlobs =
-		!gitignore.anyNegation && gitignore.ignoreGlobs.length > 0;
-	const initialExclude = useIgnoreGlobs
-		? patternsToGlob(new Set([...basePatterns, ...gitignore.ignoreGlobs]))
-		: baseExclude;
+	// Candidate enumeration is cached across opens and invalidated by the file
+	// watcher (see `activate`). A warm cache makes reopening near-instant; a cold
+	// one pays for a single workspace walk.
+	const data = await ensureCache(config);
 
-	// Enumerate candidates once up front. With the gitignore globs folded in,
-	// this walk never descends into ignored directories.
-	const uris = await vscode.workspace.findFiles("**/*", initialExclude);
-	if (uris.length === 0 && !useIgnoreGlobs) {
+	if (data.candidates.length === 0 && !data.useIgnoreGlobs) {
 		quickPick.dispose();
 		vscode.window.showInformationMessage("No files found in the workspace.");
 		return;
 	}
 
-	const candidates: Candidate[] = uris.map((uri) => ({
-		uri,
-		relPath: vscode.workspace.asRelativePath(uri),
-	}));
-
 	// Files matched by .gitignore are hidden by default, mirroring VS Code's own
 	// Quick Open (which honors `search.useIgnoreFiles`). The user can toggle them
 	// in via Ctrl+H while the search is open.
-	const isIgnored = gitignore.isIgnored;
 	let includeIgnored = false;
-	let activeCandidates = candidates.filter((c) => !isIgnored(c.relPath));
-
-	// When the gitignore globs were folded into the walk above, ignored files
-	// were never enumerated. Load the full list lazily the first time the user
-	// toggles ignored files on.
-	let fullLoaded = !useIgnoreGlobs;
-
-	// Longest path across all candidates. Each candidate is padded up to this
-	// length so that short paths don't get an unfair skip-cost discount.
-	let maxPathLen = computeMaxPathLen(candidates);
+	let activeCandidates = data.visible;
 
 	// Two interchangeable match algorithms; both return a distance (lower =
 	// better). The user can switch between them via the toolbar button or the
 	// Ctrl+Alt+H keybinding.
 	const levvyScorer = new LevvyScorer();
 	const cosineScorer = new CosineScorer();
-	let useCosine = true;
+	// Seeded from the persisted preference; toggling updates the setting so the
+	// choice is remembered across opens and restarts.
+	let useCosine = config.get<string>("matchAlgorithm", "cosine") !== "levvy";
 	const score = (q: string, h: string, padding: number): number =>
 		useCosine
 			? cosineScorer.score(q, h, padding)
@@ -176,7 +362,7 @@ async function searchFiles(): Promise<void> {
 		list
 			.map((c) => ({
 				c,
-				score: score(query, c.relPath, maxPathLen - c.relPath.length),
+				score: score(query, c.relPath, data.maxPathLen - c.relPath.length),
 			}))
 			.sort(
 				(a, b) => a.score - b.score || a.c.relPath.length - b.c.relPath.length,
@@ -192,35 +378,28 @@ async function searchFiles(): Promise<void> {
 
 	const toggleIgnored = async () => {
 		includeIgnored = !includeIgnored;
-		if (includeIgnored && !fullLoaded) {
-			fullLoaded = true;
+		if (includeIgnored && !data.fullLoaded) {
 			quickPick.busy = true;
 			try {
-				// Ignored files were skipped by the initial walk; fetch them now.
-				const allUris = await vscode.workspace.findFiles("**/*", baseExclude);
-				const known = new Set(candidates.map((c) => c.uri.toString()));
-				for (const uri of allUris) {
-					if (!known.has(uri.toString())) {
-						candidates.push({
-							uri,
-							relPath: vscode.workspace.asRelativePath(uri),
-						});
-					}
-				}
-				maxPathLen = computeMaxPathLen(candidates);
+				// Ignored files were skipped by the folded walk; fetch them now.
+				await ensureFullCandidates(data);
 			} finally {
 				quickPick.busy = false;
 			}
 		}
-		activeCandidates = includeIgnored
-			? candidates
-			: candidates.filter((c) => !isIgnored(c.relPath));
+		activeCandidates = includeIgnored ? data.candidates : data.visible;
 		updateTitle();
 		rank(quickPick.value);
 	};
 
 	const toggleScorer = () => {
 		useCosine = !useCosine;
+		// Persist the choice so future searches open with the same algorithm.
+		void config.update(
+			"matchAlgorithm",
+			useCosine ? "cosine" : "levvy",
+			vscode.ConfigurationTarget.Global,
+		);
 		updateTitle();
 		rank(quickPick.value);
 	};
@@ -343,47 +522,51 @@ function computeMaxPathLen(...lists: Candidate[][]): number {
 	return max;
 }
 
+type GitignoreMatcher = { dir: string; ig: ReturnType<typeof ignore> };
+
 /**
- * Loads the project's `.gitignore` rules — the same source of truth VS Code's
- * own Quick Open uses when `search.useIgnoreFiles` is enabled.
- *
- * Returns three things:
- * - `isIgnored`: an authoritative predicate (backed by the `ignore` library)
- *   reporting whether a workspace-relative path is gitignored.
+ * The candidate root `.gitignore` locations: one at the root of each workspace
+ * folder. These are read directly instead of discovered via a file walk — the
+ * walk to locate them dominated first-open latency, and the root file is the
+ * overwhelmingly common case. Missing files are tolerated by
+ * {@link collectGitignore}, which skips anything it can't read.
+ */
+function rootGitignoreUris(): vscode.Uri[] {
+	return (vscode.workspace.workspaceFolders ?? []).map((folder) =>
+		vscode.Uri.joinPath(folder.uri, ".gitignore"),
+	);
+}
+
+/**
+ * Reads the given `.gitignore` files and builds, from the same source of truth
+ * VS Code's own Quick Open uses:
+ * - `matchers`: authoritative `ignore`-library matchers, each rooted at the
+ *   directory containing its `.gitignore` (git semantics).
  * - `ignoreGlobs`: `findFiles` exclude globs derived from the rules, used to
  *   prune ignored directories from the walk as a performance optimization.
  * - `anyNegation`: whether any rule uses negation (`!pattern`). Negations can't
  *   be expressed safely as excludes, so the caller falls back to JS filtering.
  *
- * All `.gitignore` files in the workspace are collected; each one's rules apply
- * to paths at or below the directory that contains it, matching git semantics.
- * The `.gitignore` search honors `excludeGlob` so it doesn't descend into
- * already-excluded directories (e.g. `node_modules`) hunting for nested files.
+ * Files that don't exist or can't be read are silently skipped.
  */
-async function buildGitignore(
-	excludeGlob: vscode.GlobPattern | undefined,
-): Promise<{
-	isIgnored: (relPath: string) => boolean;
+async function collectGitignore(uris: vscode.Uri[]): Promise<{
+	matchers: GitignoreMatcher[];
 	ignoreGlobs: string[];
 	anyNegation: boolean;
 }> {
-	const gitignoreUris = await vscode.workspace.findFiles(
-		"**/.gitignore",
-		excludeGlob,
-	);
-
+	const decoder = new TextDecoder();
 	const contents = await Promise.all(
-		gitignoreUris.map(async (uri) => {
+		uris.map(async (uri) => {
 			try {
-				const doc = await vscode.workspace.openTextDocument(uri);
-				return { uri, content: doc.getText() };
+				const bytes = await vscode.workspace.fs.readFile(uri);
+				return { uri, content: decoder.decode(bytes) };
 			} catch {
 				return undefined;
 			}
 		}),
 	);
 
-	const matchers: { dir: string; ig: ReturnType<typeof ignore> }[] = [];
+	const matchers: GitignoreMatcher[] = [];
 	const ignoreGlobs: string[] = [];
 	let anyNegation = false;
 
@@ -403,28 +586,37 @@ async function buildGitignore(
 		ignoreGlobs.push(...globs);
 	}
 
-	const isIgnored =
-		matchers.length === 0
-			? () => false
-			: (relPath: string): boolean => {
-					const path = relPath.replace(/\\/g, "/");
-					for (const { dir, ig } of matchers) {
-						let sub: string;
-						if (dir === "") {
-							sub = path;
-						} else if (path === dir || path.startsWith(`${dir}/`)) {
-							sub = path.slice(dir.length + 1);
-						} else {
-							continue;
-						}
-						if (sub && ig.ignores(sub)) {
-							return true;
-						}
-					}
-					return false;
-				};
+	return { matchers, ignoreGlobs, anyNegation };
+}
 
-	return { isIgnored, ignoreGlobs, anyNegation };
+/**
+ * Builds the authoritative "is this workspace-relative path gitignored?"
+ * predicate from a set of matchers, each rooted at the directory containing its
+ * `.gitignore`.
+ */
+function buildIsIgnored(
+	matchers: GitignoreMatcher[],
+): (relPath: string) => boolean {
+	if (matchers.length === 0) {
+		return () => false;
+	}
+	return (relPath: string): boolean => {
+		const path = relPath.replace(/\\/g, "/");
+		for (const { dir, ig } of matchers) {
+			let sub: string;
+			if (dir === "") {
+				sub = path;
+			} else if (path === dir || path.startsWith(`${dir}/`)) {
+				sub = path.slice(dir.length + 1);
+			} else {
+				continue;
+			}
+			if (sub && ig.ignores(sub)) {
+				return true;
+			}
+		}
+		return false;
+	};
 }
 
 /**
