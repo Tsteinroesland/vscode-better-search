@@ -37,6 +37,27 @@ extension loaded. Run the command from the Command Palette (`Ctrl+Shift+P`) →
 | `betterFileSearch.maxResults`   | `50`                                     | Max number of results to show.    |
 | `betterFileSearch.excludeGlobs` | `["**/node_modules/**", "**/.git/**"]` | Glob patterns to exclude.         |
 
+## Context keys
+
+The extension exposes the following [`when`-clause context key](https://code.visualstudio.com/api/references/when-clause-contexts),
+which you can reference in your own keybindings:
+
+| Context key                     | True when…                                |
+| ------------------------------- | ----------------------------------------- |
+| `betterFileSearch.searchActive` | the Better File Search quick pick is open |
+
+The `Toggle Gitignored Files` and `Toggle Match Algorithm` commands ship without
+a default keybinding. To bind one that only fires while the picker is open — so
+the same key still does its normal job elsewhere — gate it on the context key:
+
+```json
+{
+  "key": "ctrl+h",
+  "command": "betterFileSearch.toggleIgnored",
+  "when": "betterFileSearch.searchActive"
+}
+```
+
 ## Packaging
 
 Install [`vsce`](https://github.com/microsoft/vscode-vsce) and run:

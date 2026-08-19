@@ -78,10 +78,9 @@ export const cosineSimilarity = (q: string, h: string): number => {
 
 /**
  * Convenience scorer returning a *distance* (lower = better match), so it is a
- * drop-in replacement for {@link scoreLevvy}. `padding` is accepted for API
- * compatibility but unused: cosine similarity is already length-normalized.
+ * drop-in replacement for {@link scoreLevvy}.
  */
-export const scoreCosine = (q: string, h: string, _padding = 0): number => {
+export const scoreCosine = (q: string, h: string): number => {
   return 1 - cosineSimilarity(q, h)
 }
 
@@ -106,7 +105,7 @@ export class CosineScorer {
     this.cachedNorm = norm(this.cachedCounts)
   }
 
-  score(q: string, h: string, _padding = 0): number {
+  score(q: string, h: string): number {
     this.prepareQuery(q)
     const qn = this.cachedNorm
     if (qn === 0) return 1

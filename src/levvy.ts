@@ -168,9 +168,10 @@ export const iterativeLevvy = (q: string, h: string, padding: number, dp: number
 export const iterativeLevvy_fast = (
   q: string,
   h: string,
-  padding: number,
   dp_current: number[],
-  dp_previous: number[]
+  dp_previous: number[],
+  hCodeBuf?: number[],
+  hLowerBuf?: number[]
 ): number => {
   const q_len = q.length
   const h_len = h.length
@@ -179,12 +180,24 @@ export const iterativeLevvy_fast = (
   const B = 2 // consecutive_match flag can be 0 or 1
   // const HB = H * B;
 
-  const padding_cost = padding * skip_cost
   const bias = Math.min(q_len, h_len) * streak_bias
+
+  // Precompute the haystack char codes once, since they don't depend on the
+  // query index. This turns the inner loop's charCodeAt/case work from
+  // O(q_len * h_len) into O(h_len). `hCode` is the raw view; `hLower` folds
+  // A–Z to lower case for the case-insensitive comparisons. The caller can pass
+  // reusable buffers (see LevvyScorer) to avoid per-call allocation.
+  const hCode = hCodeBuf ?? new Array<number>(h_len)
+  const hLower = case_setting === 0 ? hCode : hLowerBuf ?? new Array<number>(h_len)
+  for (let h_i = 0; h_i < h_len; h_i++) {
+    const b = h.charCodeAt(h_i)
+    hCode[h_i] = b
+    if (case_setting !== 0) hLower[h_i] = 65 <= b && b <= 90 ? b + 32 : b
+  }
 
   // Base case initialization for q_i = q_len
   for (let h_i = 0; h_i <= h_len; h_i++) {
-    const dist = (h_len - h_i) * skip_cost + padding_cost + bias
+    const dist = (h_len - h_i) * skip_cost + bias
     dp_previous[h_i * B + 0] = dist
     dp_previous[h_i * B + 1] = dist
   }
@@ -192,29 +205,28 @@ export const iterativeLevvy_fast = (
   // Main DP loop
   for (let q_i = q_len - 1; q_i >= 0; q_i--) {
     // Initialize dp_current for h_i = h_len
-    const dist = (q_len - q_i) * del_cost + padding_cost + bias
+    const dist = (q_len - q_i) * del_cost + bias
     dp_current[h_len * B + 0] = dist
     dp_current[h_len * B + 1] = dist
 
+    // Per-query-char work, hoisted out of the inner loop. `a` is the (possibly
+    // lower-cased) query code; `hRef` selects the raw or lower-cased haystack
+    // view so the inner loop reduces to a single equality check per cell.
+    let a = q.charCodeAt(q_i)
+    let hRef = hCode
+    if (case_setting === 2) {
+      if (65 <= a && a <= 90) a += 32
+      hRef = hLower
+    } else if (case_setting === 1 && 97 <= a && a <= 122) {
+      hRef = hLower
+    }
+
     for (let h_i = h_len - 1; h_i >= 0; h_i--) {
-      const a = q.charCodeAt(q_i)
-      const b = h.charCodeAt(h_i)
-
-      let adjustedA = a
-      let adjustedB = b
-
-      if (case_setting === 2) {
-        if (65 <= a && a <= 90) adjustedA = a + 32
-        if (65 <= b && b <= 90) adjustedB = b + 32
-      } else if (case_setting === 1 && 97 <= a && a <= 122) {
-        if (65 <= b && b <= 90) adjustedB = b + 32
-      }
-
-      const is_match = adjustedA === adjustedB
+      const is_match = a === hRef[h_i]
 
       // Access dp values from dp_previous and dp_current arrays
       const index_current = h_i * B
-      const index_next = (h_i + 1) * B
+      const index_next = index_current + B
 
       // Deletion (cm == 0)
       const del_cost_total = del_cost + dp_previous[index_current + 0] // cm remains the same after deletion
@@ -265,9 +277,9 @@ export const iterativeLevvy_fast = (
  * For ranking many candidates against one query, prefer {@link LevvyScorer},
  * which reuses its buffers across calls instead of allocating per score.
  */
-export const scoreLevvy = (q: string, h: string, padding = 0): number => {
+export const scoreLevvy = (q: string, h: string): number => {
   const width = (h.length + 1) * 2
-  return iterativeLevvy_fast(q, h, padding, new Array(width), new Array(width))
+  return iterativeLevvy_fast(q, h, new Array(width), new Array(width))
 }
 
 /**
@@ -278,13 +290,19 @@ export const scoreLevvy = (q: string, h: string, padding = 0): number => {
 export class LevvyScorer {
   private current: number[] = []
   private previous: number[] = []
+  private hCode: number[] = []
+  private hLower: number[] = []
 
-  score(q: string, h: string, padding = 0): number {
+  score(q: string, h: string): number {
     const width = (h.length + 1) * 2
     if (this.current.length < width) {
       this.current = new Array(width)
       this.previous = new Array(width)
     }
-    return iterativeLevvy_fast(q, h, padding, this.current, this.previous)
+    if (this.hCode.length < h.length) {
+      this.hCode = new Array(h.length)
+      this.hLower = new Array(h.length)
+    }
+    return iterativeLevvy_fast(q, h, this.current, this.previous, this.hCode, this.hLower)
   }
 }
