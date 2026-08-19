@@ -41,11 +41,6 @@
         "command": "betterFileSearch.search",
         "key": "ctrl+alt+f",
         "mac": "cmd+alt+f"
-      },
-      {
-        "command": "betterFileSearch.toggleScorer",
-        "key": "ctrl+alt+h",
-        "when": "betterFileSearch.searchActive"
       }
     ],
     "configuration": {
