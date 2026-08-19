@@ -83,7 +83,7 @@
             "Levvy edit distance — rewards contiguous matches via a streak bonus."
           ],
           "default": "cosine",
-          "markdownDescription": "Which algorithm ranks results. Toggling with the toolbar button or `Ctrl+Alt+H` while a search is open updates this setting."
+          "markdownDescription": "Which algorithm ranks results. Toggling with the toolbar button (or the *Toggle Match Algorithm* command) while a search is open updates this setting."
         },
         "betterFileSearch.useWorkspaceExcludes": {
           "type": "boolean",
