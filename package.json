@@ -43,11 +43,6 @@
         "mac": "cmd+alt+f"
       },
       {
-        "command": "betterFileSearch.toggleIgnored",
-        "key": "ctrl+h",
-        "when": "betterFileSearch.searchActive"
-      },
-      {
         "command": "betterFileSearch.toggleScorer",
         "key": "ctrl+alt+h",
         "when": "betterFileSearch.searchActive"
@@ -60,6 +55,13 @@
           "type": "number",
           "default": 50,
           "description": "Maximum number of results to show."
+        },
+        "betterFileSearch.filenameWeight": {
+          "type": "number",
+          "default": 0.6,
+          "minimum": 0,
+          "maximum": 1,
+          "markdownDescription": "How much the file *name* matters versus the full *path* when ranking. `1` ranks purely by filename, `0` purely by path; the default `0.6` leans toward the filename while still rewarding folder matches."
         },
         "betterFileSearch.excludeGlobs": {
           "type": "array",

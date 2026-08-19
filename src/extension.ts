@@ -85,6 +85,8 @@ let activeToggleScorer: (() => void) | undefined;
 interface Candidate {
 	uri: vscode.Uri;
 	relPath: string;
+	/** Basename of `relPath`, precomputed so ranking doesn't re-split each key. */
+	name: string;
 }
 
 /**
@@ -106,8 +108,6 @@ interface WorkspaceCache {
 	candidates: Candidate[];
 	/** Non-ignored subset — shown by default. Stable across lazy full loads. */
 	visible: Candidate[];
-	/** Longest relPath among `candidates`, for score padding. */
-	maxPathLen: number;
 	/** Whether gitignore globs were folded into the initial walk. */
 	useIgnoreGlobs: boolean;
 	/** Whether `candidates` already holds the full (gitignore-inclusive) set. */
@@ -197,10 +197,10 @@ async function loadCandidates(
 		...nestedGitignore.matchers,
 	]);
 
-	const candidates: Candidate[] = uris.map((uri) => ({
-		uri,
-		relPath: relativize(uri),
-	}));
+	const candidates: Candidate[] = uris.map((uri) => {
+		const relPath = relativize(uri);
+		return { uri, relPath, name: basename(relPath) };
+	});
 	const visible = candidates.filter((c) => !isIgnored(c.relPath));
 
 	return {
@@ -210,7 +210,6 @@ async function loadCandidates(
 		isIgnored,
 		candidates,
 		visible,
-		maxPathLen: computeMaxPathLen(candidates),
 		useIgnoreGlobs,
 		fullLoaded: !useIgnoreGlobs,
 	};
@@ -230,10 +229,10 @@ async function ensureFullCandidates(data: WorkspaceCache): Promise<void> {
 	const known = new Set(data.candidates.map((c) => c.uri.toString()));
 	for (const uri of allUris) {
 		if (!known.has(uri.toString())) {
-			data.candidates.push({ uri, relPath: data.relativize(uri) });
+			const relPath = data.relativize(uri);
+			data.candidates.push({ uri, relPath, name: basename(relPath) });
 		}
 	}
-	data.maxPathLen = computeMaxPathLen(data.candidates);
 }
 
 /**
@@ -310,10 +309,21 @@ async function searchFiles(): Promise<void> {
 	// Seeded from the persisted preference; toggling updates the setting so the
 	// choice is remembered across opens and restarts.
 	let useCosine = config.get<string>("matchAlgorithm", "cosine") !== "levvy";
-	const score = (q: string, h: string, padding: number): number =>
+
+	// How much the filename matters versus the full path when blending scores.
+	const filenameWeight = Math.min(
+		1,
+		Math.max(0, config.get<number>("filenameWeight", 0.6)),
+	);
+
+	// A length-normalized match distance in a comparable range across scorers, so
+	// the filename and full-path passes can be blended. Cosine is already
+	// length-independent in [0, 1]; Levvy returns a raw edit cost, so we divide by
+	// the haystack length to get a per-character cost.
+	const distance = (q: string, h: string): number =>
 		useCosine
-			? cosineScorer.score(q, h, padding)
-			: levvyScorer.score(q, h, padding);
+			? cosineScorer.score(q, h)
+			: levvyScorer.score(q, h) / Math.max(1, h.length);
 
 	const scorerName = () => (useCosine ? "Cosine similarity" : "Levvy distance");
 	const otherScorerName = () =>
@@ -350,20 +360,25 @@ async function searchFiles(): Promise<void> {
 	};
 
 	const toItem = (c: Candidate): Item => ({
-		label: basename(c.relPath),
+		label: c.name,
 		description: c.relPath,
 		uri: c.uri,
 		alwaysShow: true,
 	});
 
-	// Orders candidates by match quality for the given query. Lower score wins;
-	// on ties, the shorter path wins.
+	// Orders candidates by match quality for the given query. Blends a filename
+	// pass with a full-path pass so the name dominates but folder text still
+	// counts; lower is better. On ties, the shorter path wins.
 	const rankCandidates = (query: string, list: Candidate[]): Candidate[] =>
 		list
-			.map((c) => ({
-				c,
-				score: score(query, c.relPath, data.maxPathLen - c.relPath.length),
-			}))
+			.map((c) => {
+				const nameD = distance(query, c.name);
+				const pathD = distance(query, c.relPath);
+				return {
+					c,
+					score: filenameWeight * nameD + (1 - filenameWeight) * pathD,
+				};
+			})
 			.sort(
 				(a, b) => a.score - b.score || a.c.relPath.length - b.c.relPath.length,
 			)
@@ -509,17 +524,6 @@ function addExcludePattern(patterns: Set<string>, glob: string): void {
 function basename(p: string): string {
 	const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
 	return i === -1 ? p : p.slice(i + 1);
-}
-
-/** Longest `relPath` across the given candidate lists. */
-function computeMaxPathLen(...lists: Candidate[][]): number {
-	let max = 0;
-	for (const list of lists) {
-		for (const c of list) {
-			max = Math.max(max, c.relPath.length);
-		}
-	}
-	return max;
 }
 
 type GitignoreMatcher = { dir: string; ig: ReturnType<typeof ignore> };
