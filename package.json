@@ -85,6 +85,11 @@
           "default": "cosine",
           "markdownDescription": "Which algorithm ranks results. Toggling with the toolbar button (or the *Toggle Match Algorithm* command) while a search is open updates this setting."
         },
+        "betterFileSearch.showIgnoredFiles": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Whether to include gitignored files in search results. Toggling with the toolbar button (or the *Toggle Ignored Files* command) while a search is open updates this setting."
+        },
         "betterFileSearch.useWorkspaceExcludes": {
           "type": "boolean",
           "default": true,

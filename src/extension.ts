@@ -298,8 +298,20 @@ async function searchFiles(): Promise<void> {
 	// Files matched by .gitignore are hidden by default, mirroring VS Code's own
 	// Quick Open (which honors `search.useIgnoreFiles`). The user can toggle them
 	// in via Ctrl+H while the search is open.
-	let includeIgnored = false;
-	let activeCandidates = data.visible;
+	// Seeded from the persisted preference; toggling updates the setting so the
+	// choice is remembered across opens and restarts.
+	let includeIgnored = config.get<boolean>("showIgnoredFiles", false);
+	// If the persisted preference is to show ignored files, load them now before
+	// the first render so the initial candidate set is already complete.
+	if (includeIgnored && !data.fullLoaded) {
+		quickPick.busy = true;
+		try {
+			await ensureFullCandidates(data);
+		} finally {
+			quickPick.busy = false;
+		}
+	}
+	let activeCandidates = includeIgnored ? data.candidates : data.visible;
 
 	// Two interchangeable match algorithms; both return a distance (lower =
 	// better). The user can switch between them via the toolbar button or the
@@ -393,6 +405,12 @@ async function searchFiles(): Promise<void> {
 
 	const toggleIgnored = async () => {
 		includeIgnored = !includeIgnored;
+		// Persist the choice so future searches open with the same state.
+		void config.update(
+			"showIgnoredFiles",
+			includeIgnored,
+			vscode.ConfigurationTarget.Global,
+		);
 		if (includeIgnored && !data.fullLoaded) {
 			quickPick.busy = true;
 			try {
