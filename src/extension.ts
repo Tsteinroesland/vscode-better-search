@@ -8,10 +8,16 @@ import { LevvyScorer } from "./levvy";
  * the contributed commands, VS Code loads this module and calls `activate`.
  */
 export function activate(context: vscode.ExtensionContext): void {
+	// Tracks the files the user opens so the search can surface them even when
+	// they're gitignored (and thus hidden by default). Seeded from the tabs that
+	// are already open when the extension activates.
+	const recentFiles = new RecentFiles(context);
+	recentFiles.seedFromOpenTabs();
+
 	const searchCommand = vscode.commands.registerCommand(
 		"betterFileSearch.search",
 		async () => {
-			await searchFiles();
+			await searchFiles(recentFiles);
 		},
 	);
 
@@ -61,11 +67,17 @@ export function activate(context: vscode.ExtensionContext): void {
 	watcher.onDidDelete((u) => onFsEvent(u, false));
 	watcher.onDidChange((u) => onFsEvent(u, true));
 
+	// Keep the recent list current as the user moves between editors.
+	const editorTracker = vscode.window.onDidChangeActiveTextEditor((editor) => {
+		recentFiles.touch(editor?.document.uri);
+	});
+
 	context.subscriptions.push(
 		searchCommand,
 		toggleCommand,
 		toggleScorerCommand,
 		watcher,
+		editorTracker,
 	);
 }
 
@@ -267,7 +279,7 @@ function makeRelativize(): (uri: vscode.Uri) => string {
  * A fuzzy file finder. Enumerates workspace files once, then re-ranks them on
  * every keystroke using the Levvy distance (lower = better match).
  */
-async function searchFiles(): Promise<void> {
+async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	const config = vscode.workspace.getConfiguration("betterFileSearch");
 	const maxResults = config.get<number>("maxResults", 50);
 
@@ -288,6 +300,14 @@ async function searchFiles(): Promise<void> {
 	// watcher (see `activate`). A warm cache makes reopening near-instant; a cold
 	// one pays for a single workspace walk.
 	const data = await ensureCache(config);
+
+	// Recently opened files, most-recent-first, resolved directly from disk so
+	// they surface even when gitignored (and therefore skipped by the walk).
+	// Merged into the candidate list below rather than shown as a separate group.
+	const recentCandidates = await resolveRecentCandidates(
+		recentFiles,
+		data.relativize,
+	);
 
 	if (data.candidates.length === 0 && !data.useIgnoreGlobs) {
 		quickPick.dispose();
@@ -311,7 +331,10 @@ async function searchFiles(): Promise<void> {
 			quickPick.busy = false;
 		}
 	}
-	let activeCandidates = includeIgnored ? data.candidates : data.visible;
+	let activeCandidates = mergeRecent(
+		includeIgnored ? data.candidates : data.visible,
+		recentCandidates,
+	);
 
 	// Two interchangeable match algorithms; both return a distance (lower =
 	// better). The user can switch between them via the toolbar button or the
@@ -420,7 +443,10 @@ async function searchFiles(): Promise<void> {
 				quickPick.busy = false;
 			}
 		}
-		activeCandidates = includeIgnored ? data.candidates : data.visible;
+		activeCandidates = mergeRecent(
+			includeIgnored ? data.candidates : data.visible,
+			recentCandidates,
+		);
 		updateTitle();
 		rank(quickPick.value);
 	};
@@ -542,6 +568,92 @@ function addExcludePattern(patterns: Set<string>, glob: string): void {
 function basename(p: string): string {
 	const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
 	return i === -1 ? p : p.slice(i + 1);
+}
+
+/**
+ * Tracks the files the user has opened, most-recent-first, persisted in
+ * workspace storage so it survives reloads. VS Code exposes no public API for
+ * its own "Open Recent" list, so we maintain our own from editor activations
+ * and the tabs already open at activation.
+ */
+class RecentFiles {
+	private static readonly KEY = "betterFileSearch.recentFiles";
+	private static readonly MAX = 100;
+	private order: string[];
+
+	constructor(private readonly context: vscode.ExtensionContext) {
+		this.order = context.workspaceState.get<string[]>(RecentFiles.KEY, []);
+	}
+
+	/** Records `uri` (a real on-disk file) as the most recently used. */
+	touch(uri: vscode.Uri | undefined): void {
+		if (uri?.scheme !== "file") {
+			return;
+		}
+		const key = uri.toString();
+		this.order = [key, ...this.order.filter((u) => u !== key)].slice(
+			0,
+			RecentFiles.MAX,
+		);
+		void this.context.workspaceState.update(RecentFiles.KEY, this.order);
+	}
+
+	/** Seeds the list from currently open tabs (oldest first, active last). */
+	seedFromOpenTabs(): void {
+		for (const group of vscode.window.tabGroups.all) {
+			for (const tab of group.tabs) {
+				if (tab.input instanceof vscode.TabInputText) {
+					this.touch(tab.input.uri);
+				}
+			}
+		}
+	}
+
+	/** Returns the tracked files, most-recent-first. */
+	list(): vscode.Uri[] {
+		return this.order.map((u) => vscode.Uri.parse(u));
+	}
+}
+
+/**
+ * Resolves the recently opened files into candidates, most-recent-first. They
+ * are looked up by URI rather than intersected with the workspace walk, so they
+ * still surface even when gitignored (and therefore skipped by the walk). Files
+ * that no longer exist on disk are dropped.
+ */
+async function resolveRecentCandidates(
+	recentFiles: RecentFiles,
+	relativize: (uri: vscode.Uri) => string,
+): Promise<Candidate[]> {
+	const resolved = await Promise.all(
+		recentFiles.list().map(async (uri) => {
+			try {
+				const stat = await vscode.workspace.fs.stat(uri);
+				if (stat.type & vscode.FileType.File) {
+					const relPath = relativize(uri);
+					return { uri, relPath, name: basename(relPath) } as Candidate;
+				}
+			} catch {
+				// File no longer exists; drop it.
+			}
+			return undefined;
+		}),
+	);
+	return resolved.filter((c): c is Candidate => c !== undefined);
+}
+
+/**
+ * Prepends recently opened files to a candidate list, most-recent-first, so they
+ * show first on an empty query and win ties during ranking. Any copy already in
+ * `base` is dropped in favor of the recent one, keeping each file unique.
+ */
+function mergeRecent(base: Candidate[], recent: Candidate[]): Candidate[] {
+	if (recent.length === 0) {
+		return base;
+	}
+	const recentKeys = new Set(recent.map((c) => c.uri.toString()));
+	const rest = base.filter((c) => !recentKeys.has(c.uri.toString()));
+	return [...recent, ...rest];
 }
 
 type GitignoreMatcher = { dir: string; ig: ReturnType<typeof ignore> };
