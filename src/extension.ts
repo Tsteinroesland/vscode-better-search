@@ -47,8 +47,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	// like out of these events entirely.
 	const watcher = vscode.workspace.createFileSystemWatcher("**/*");
 	const onFsEvent = (uri: vscode.Uri, contentChange: boolean): void => {
-		const cache = workspaceCache;
-		if (!cache) {
+		if (caches.size === 0) {
 			return;
 		}
 		if (basename(uri.path) === ".gitignore") {
@@ -58,10 +57,18 @@ export function activate(context: vscode.ExtensionContext): void {
 		if (contentChange) {
 			return;
 		}
-		if (cache.isIgnored(cache.relativize(uri))) {
+		// A create/delete only matters to a cache whose base contains the file and
+		// that isn't already ignoring it (churn inside ignored trees is skipped).
+		for (const cache of caches.values()) {
+			if (!uriInFolders(uri, cache.folders)) {
+				continue;
+			}
+			if (cache.isIgnored(cache.relativize(uri))) {
+				continue;
+			}
+			invalidateCache();
 			return;
 		}
-		invalidateCache();
 	};
 	watcher.onDidCreate((u) => onFsEvent(u, false));
 	watcher.onDidDelete((u) => onFsEvent(u, false));
@@ -124,52 +131,61 @@ interface WorkspaceCache {
 	useIgnoreGlobs: boolean;
 	/** Whether `candidates` already holds the full (gitignore-inclusive) set. */
 	fullLoaded: boolean;
-}
-
-/** Cached workspace enumeration, or `undefined` when cold/invalidated. */
-let workspaceCache: WorkspaceCache | undefined;
-/** In-flight cache build, so concurrent opens share a single walk. */
-let cacheLoading: Promise<WorkspaceCache> | undefined;
-
-/** Drops the cache so the next search re-enumerates. Called by the watcher. */
-function invalidateCache(): void {
-	workspaceCache = undefined;
+	/** The folders this cache enumerated; used for lazy loads and watcher scoping. */
+	folders: SearchFolder[];
 }
 
 /**
- * Signature capturing everything that affects the candidate set: the workspace
- * folders and the resolved exclude patterns. A change rebuilds the cache.
+ * Cached enumerations, keyed by cache signature (see {@link cacheSignature}).
+ * One entry per search base — a workspace or a Git repo the active file belongs
+ * to — so returning to a previously searched base stays instant.
  */
-function cacheSignature(basePatterns: Set<string>): string {
-	const folders = (vscode.workspace.workspaceFolders ?? []).map((f) =>
-		f.uri.toString(),
-	);
-	return JSON.stringify({ folders, patterns: [...basePatterns].sort() });
+const caches = new Map<string, WorkspaceCache>();
+/** In-flight cache builds, so concurrent opens of the same base share a walk. */
+const cacheLoading = new Map<string, Promise<WorkspaceCache>>();
+
+/** Drops all caches so the next search re-enumerates. Called by the watcher. */
+function invalidateCache(): void {
+	caches.clear();
 }
 
 /**
- * Returns the workspace enumeration, reusing the cache when its signature still
- * matches. Concurrent callers share one in-flight build.
+ * Signature capturing everything that affects the candidate set: the search base
+ * (workspace folders or the active file's Git repo) and the resolved exclude
+ * patterns. A change selects a different cache entry, rebuilding if unseen.
+ */
+function cacheSignature(basePatterns: Set<string>, baseKey: string): string {
+	return JSON.stringify({ base: baseKey, patterns: [...basePatterns].sort() });
+}
+
+/**
+ * Returns the enumeration for `base`, reusing its cache entry when one exists.
+ * Concurrent callers for the same base share one in-flight build.
  */
 async function ensureCache(
 	config: vscode.WorkspaceConfiguration,
+	base: { folders: SearchFolder[]; key: string },
 ): Promise<WorkspaceCache> {
 	const basePatterns = buildExcludePatterns(config);
-	const signature = cacheSignature(basePatterns);
-	if (workspaceCache && workspaceCache.signature === signature) {
-		return workspaceCache;
+	const signature = cacheSignature(basePatterns, base.key);
+	const cached = caches.get(signature);
+	if (cached) {
+		return cached;
 	}
-	if (!cacheLoading) {
-		cacheLoading = loadCandidates(basePatterns, signature)
+	let loading = cacheLoading.get(signature);
+	if (!loading) {
+		const relativize = makeRelativize(base.folders);
+		loading = loadCandidates(basePatterns, signature, base.folders, relativize)
 			.then((c) => {
-				workspaceCache = c;
+				caches.set(signature, c);
 				return c;
 			})
 			.finally(() => {
-				cacheLoading = undefined;
+				cacheLoading.delete(signature);
 			});
+		cacheLoading.set(signature, loading);
 	}
-	return cacheLoading;
+	return loading;
 }
 
 /**
@@ -180,12 +196,13 @@ async function ensureCache(
 async function loadCandidates(
 	basePatterns: Set<string>,
 	signature: string,
+	folders: SearchFolder[],
+	relativize: (uri: vscode.Uri) => string,
 ): Promise<WorkspaceCache> {
 	const baseExclude = patternsToGlob(basePatterns);
-	const relativize = makeRelativize();
 
-	const rootUris = rootGitignoreUris();
-	const rootGitignore = await collectGitignore(rootUris);
+	const rootUris = rootGitignoreUris(folders);
+	const rootGitignore = await collectGitignore(rootUris, relativize);
 
 	const useIgnoreGlobs =
 		!rootGitignore.anyNegation && rootGitignore.ignoreGlobs.length > 0;
@@ -193,7 +210,7 @@ async function loadCandidates(
 		? patternsToGlob(new Set([...basePatterns, ...rootGitignore.ignoreGlobs]))
 		: baseExclude;
 
-	const uris = await vscode.workspace.findFiles("**/*", initialExclude);
+	const uris = await findFilesIn(folders, initialExclude);
 
 	// Nested .gitignore files weren't pruned by the walk, so they appear in its
 	// results. Merge their rules with the root ones. Nested rules aren't folded
@@ -203,7 +220,7 @@ async function loadCandidates(
 	const nestedUris = uris.filter(
 		(u) => basename(u.path) === ".gitignore" && !rootKeys.has(u.toString()),
 	);
-	const nestedGitignore = await collectGitignore(nestedUris);
+	const nestedGitignore = await collectGitignore(nestedUris, relativize);
 	const isIgnored = buildIsIgnored([
 		...rootGitignore.matchers,
 		...nestedGitignore.matchers,
@@ -224,6 +241,7 @@ async function loadCandidates(
 		visible,
 		useIgnoreGlobs,
 		fullLoaded: !useIgnoreGlobs,
+		folders,
 	};
 }
 
@@ -237,7 +255,7 @@ async function ensureFullCandidates(data: WorkspaceCache): Promise<void> {
 		return;
 	}
 	data.fullLoaded = true;
-	const allUris = await vscode.workspace.findFiles("**/*", data.baseExclude);
+	const allUris = await findFilesIn(data.folders, data.baseExclude);
 	const known = new Set(data.candidates.map((c) => c.uri.toString()));
 	for (const uri of allUris) {
 		if (!known.has(uri.toString())) {
@@ -253,8 +271,9 @@ async function ensureFullCandidates(data: WorkspaceCache): Promise<void> {
  * meaningful saving when mapping tens of thousands of URIs. In a multi-root
  * workspace the folder name is prefixed, matching the built-in API's default.
  */
-function makeRelativize(): (uri: vscode.Uri) => string {
-	const folders = vscode.workspace.workspaceFolders ?? [];
+function makeRelativize(
+	folders: SearchFolder[],
+): (uri: vscode.Uri) => string {
 	const multi = folders.length > 1;
 	const entries = folders.map((f) => {
 		const path = f.uri.path;
@@ -296,16 +315,21 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	quickPick.busy = true;
 	quickPick.show();
 
-	// Candidate enumeration is cached across opens and invalidated by the file
-	// watcher (see `activate`). A warm cache makes reopening near-instant; a cold
-	// one pays for a single workspace walk.
-	const data = await ensureCache(config);
+	// The search is rooted at the active file's Git repository when it has one,
+	// otherwise at the open workspace folders (see `resolveSearchBase`).
+	const base = await resolveSearchBase();
+
+	// Candidate enumeration is cached per base across opens and invalidated by the
+	// file watcher (see `activate`). A warm cache makes reopening near-instant; a
+	// cold one pays for a single walk of the base.
+	const data = await ensureCache(config, base);
 
 	// Recently opened files, most-recent-first, resolved directly from disk so
 	// they surface even when gitignored (and therefore skipped by the walk).
 	// Merged into the candidate list below rather than shown as a separate group.
 	const recentCandidates = await resolveRecentCandidates(
 		recentFiles,
+		data.folders,
 		data.relativize,
 	);
 
@@ -570,6 +594,104 @@ function basename(p: string): string {
 	return i === -1 ? p : p.slice(i + 1);
 }
 
+function dirname(p: string): string {
+	const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+	return i <= 0 ? "/" : p.slice(0, i);
+}
+
+/** A folder the search enumerates, paired with the name used to prefix its files. */
+interface SearchFolder {
+	name: string;
+	uri: vscode.Uri;
+}
+
+/**
+ * Walks up from `fileUri` (starting at its containing directory) looking for a
+ * `.git` entry — the root of a Git repository. `.git` is normally a directory,
+ * but in submodules and worktrees it's a file, so either counts. Returns the
+ * repository root, or `undefined` if the file isn't inside a repository.
+ */
+async function findGitRoot(
+	fileUri: vscode.Uri,
+): Promise<vscode.Uri | undefined> {
+	let dir = fileUri.with({ path: dirname(fileUri.path) });
+	// Stop once stepping up stops changing the path (the filesystem root).
+	let prev = "";
+	while (dir.path !== prev) {
+		const gitEntry = vscode.Uri.joinPath(dir, ".git");
+		try {
+			await vscode.workspace.fs.stat(gitEntry);
+			return dir;
+		} catch {
+			// No `.git` here; step up to the parent.
+		}
+		prev = dir.path;
+		dir = vscode.Uri.joinPath(dir, "..");
+	}
+	return undefined;
+}
+
+/**
+ * Chooses the folders the search enumerates. When the active editor's file lives
+ * in a Git repository, the search is rooted at that repository — even when it
+ * lies outside the open workspace — so results are scoped to the repo you're
+ * working in. Otherwise it falls back to the open workspace folders.
+ *
+ * The `key` uniquely identifies the base so the candidate cache can hold a
+ * separate entry per repo/workspace and reuse it when you return to one.
+ */
+async function resolveSearchBase(): Promise<{
+	folders: SearchFolder[];
+	key: string;
+}> {
+	const active = vscode.window.activeTextEditor?.document.uri;
+	if (active?.scheme === "file") {
+		const gitRoot = await findGitRoot(active);
+		if (gitRoot) {
+			return {
+				folders: [{ name: basename(gitRoot.path), uri: gitRoot }],
+				key: `git:${gitRoot.toString()}`,
+			};
+		}
+	}
+	const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => ({
+		name: f.name,
+		uri: f.uri,
+	}));
+	return {
+		folders,
+		key: `ws:${folders.map((f) => f.uri.toString()).join(",")}`,
+	};
+}
+
+/** Whether `uri` sits inside any of `folders`. */
+function uriInFolders(uri: vscode.Uri, folders: SearchFolder[]): boolean {
+	return folders.some((f) => {
+		const base = f.uri.path.endsWith("/") ? f.uri.path : `${f.uri.path}/`;
+		return uri.path === f.uri.path || uri.path.startsWith(base);
+	});
+}
+
+/**
+ * Enumerates every file under each of `folders`, honoring `exclude`. Uses a
+ * per-folder {@link vscode.RelativePattern} so the walk works even for a folder
+ * outside the open workspace (a Git repo the active file belongs to).
+ */
+async function findFilesIn(
+	folders: SearchFolder[],
+	exclude: vscode.GlobPattern | undefined,
+): Promise<vscode.Uri[]> {
+	const results = await Promise.all(
+		folders.map((f) =>
+			vscode.workspace.findFiles(
+				new vscode.RelativePattern(f.uri, "**/*"),
+				exclude,
+			),
+		),
+	);
+	return results.flat();
+}
+
 /**
  * Tracks the files the user has opened, most-recent-first, persisted in
  * workspace storage so it survives reloads. VS Code exposes no public API for
@@ -617,16 +739,21 @@ class RecentFiles {
 
 /**
  * Resolves the recently opened files into candidates, most-recent-first. They
- * are looked up by URI rather than intersected with the workspace walk, so they
- * still surface even when gitignored (and therefore skipped by the walk). Files
- * that no longer exist on disk are dropped.
+ * are looked up by URI rather than intersected with the walk, so they still
+ * surface even when gitignored (and therefore skipped by the walk). Files
+ * outside the current search base are pruned so a repo's search doesn't show
+ * recents from an unrelated base; files that no longer exist on disk are dropped.
  */
 async function resolveRecentCandidates(
 	recentFiles: RecentFiles,
+	folders: SearchFolder[],
 	relativize: (uri: vscode.Uri) => string,
 ): Promise<Candidate[]> {
 	const resolved = await Promise.all(
 		recentFiles.list().map(async (uri) => {
+			if (!uriInFolders(uri, folders)) {
+				return undefined;
+			}
 			try {
 				const stat = await vscode.workspace.fs.stat(uri);
 				if (stat.type & vscode.FileType.File) {
@@ -659,14 +786,14 @@ function mergeRecent(base: Candidate[], recent: Candidate[]): Candidate[] {
 type GitignoreMatcher = { dir: string; ig: ReturnType<typeof ignore> };
 
 /**
- * The candidate root `.gitignore` locations: one at the root of each workspace
+ * The candidate root `.gitignore` locations: one at the root of each search
  * folder. These are read directly instead of discovered via a file walk — the
  * walk to locate them dominated first-open latency, and the root file is the
  * overwhelmingly common case. Missing files are tolerated by
  * {@link collectGitignore}, which skips anything it can't read.
  */
-function rootGitignoreUris(): vscode.Uri[] {
-	return (vscode.workspace.workspaceFolders ?? []).map((folder) =>
+function rootGitignoreUris(folders: SearchFolder[]): vscode.Uri[] {
+	return folders.map((folder) =>
 		vscode.Uri.joinPath(folder.uri, ".gitignore"),
 	);
 }
@@ -683,7 +810,10 @@ function rootGitignoreUris(): vscode.Uri[] {
  *
  * Files that don't exist or can't be read are silently skipped.
  */
-async function collectGitignore(uris: vscode.Uri[]): Promise<{
+async function collectGitignore(
+	uris: vscode.Uri[],
+	relativize: (uri: vscode.Uri) => string,
+): Promise<{
 	matchers: GitignoreMatcher[];
 	ignoreGlobs: string[];
 	anyNegation: boolean;
@@ -708,7 +838,7 @@ async function collectGitignore(uris: vscode.Uri[]): Promise<{
 		if (!entry) {
 			continue;
 		}
-		const rel = vscode.workspace.asRelativePath(entry.uri).replace(/\\/g, "/");
+		const rel = relativize(entry.uri).replace(/\\/g, "/");
 		const slash = rel.lastIndexOf("/");
 		const dir = slash === -1 ? "" : rel.slice(0, slash);
 		matchers.push({ dir, ig: ignore().add(entry.content) });

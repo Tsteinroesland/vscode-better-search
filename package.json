@@ -99,12 +99,13 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run package",
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "tsc -p ./",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "package": "npx --yes @vscode/vsce package --allow-star-activation -o better-search.vsix",
+    "reinstall": "npm run package && code --install-extension better-search.vsix --force"
   },
   "devDependencies": {
     "@types/node": "^20.x",
