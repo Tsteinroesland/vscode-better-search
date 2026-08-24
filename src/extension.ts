@@ -14,6 +14,11 @@ export function activate(context: vscode.ExtensionContext): void {
 	const recentFiles = new RecentFiles(context);
 	recentFiles.seedFromOpenTabs();
 
+	// Seed from whatever's active now, in case it's already a real file.
+	if (vscode.window.activeTextEditor?.document.uri.scheme === "file") {
+		lastActiveFileUri = vscode.window.activeTextEditor.document.uri;
+	}
+
 	const searchCommand = vscode.commands.registerCommand(
 		"betterFileSearch.search",
 		async () => {
@@ -74,9 +79,14 @@ export function activate(context: vscode.ExtensionContext): void {
 	watcher.onDidDelete((u) => onFsEvent(u, false));
 	watcher.onDidChange((u) => onFsEvent(u, true));
 
-	// Keep the recent list current as the user moves between editors.
+	// Keep the recent list current as the user moves between editors, and remember
+	// the last plain-file editor so `resolveSearchBase` still has one to walk up
+	// from when a non-file view (e.g. an `oil:` buffer) is what's active.
 	const editorTracker = vscode.window.onDidChangeActiveTextEditor((editor) => {
 		recentFiles.touch(editor?.document.uri);
+		if (editor?.document.uri.scheme === "file") {
+			lastActiveFileUri = editor.document.uri;
+		}
 	});
 
 	context.subscriptions.push(
@@ -100,6 +110,14 @@ let activeToggleIgnored: (() => void | Promise<void>) | undefined;
  * open search, or `undefined` when no search is active.
  */
 let activeToggleScorer: (() => void) | undefined;
+
+/**
+ * The most recently active editor whose document has the `file` scheme. Used
+ * by `resolveSearchBase` to find a Git root even when the actually-active
+ * editor is a non-file view (e.g. an `oil:` directory buffer), which has no
+ * meaningful location to walk up from.
+ */
+let lastActiveFileUri: vscode.Uri | undefined;
 
 interface Candidate {
 	uri: vscode.Uri;
@@ -315,9 +333,10 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	quickPick.busy = true;
 	quickPick.show();
 
-	// The search is rooted at the active file's Git repository when it has one,
-	// otherwise at the open workspace folders (see `resolveSearchBase`).
-	const base = await resolveSearchBase();
+	// The search is rooted at the active file's Git repository when it has one
+	// and `searchGitRepoRoot` is enabled, otherwise at the open workspace folders
+	// (see `resolveSearchBase`).
+	const base = await resolveSearchBase(config);
 
 	// Candidate enumeration is cached per base across opens and invalidated by the
 	// file watcher (see `activate`). A warm cache makes reopening near-instant; a
@@ -632,21 +651,31 @@ async function findGitRoot(
 }
 
 /**
- * Chooses the folders the search enumerates. When the active editor's file lives
- * in a Git repository, the search is rooted at that repository — even when it
- * lies outside the open workspace — so results are scoped to the repo you're
- * working in. Otherwise it falls back to the open workspace folders.
+ * Chooses the folders the search enumerates. When `betterFileSearch.searchGitRepoRoot`
+ * is enabled and the active editor's file lives in a Git repository, the search
+ * is rooted at that repository — even when it lies outside the open workspace —
+ * so results are scoped to the repo you're working in. Otherwise it falls back
+ * to the open workspace folders.
  *
  * The `key` uniquely identifies the base so the candidate cache can hold a
  * separate entry per repo/workspace and reuse it when you return to one.
  */
-async function resolveSearchBase(): Promise<{
+async function resolveSearchBase(
+	config: vscode.WorkspaceConfiguration,
+): Promise<{
 	folders: SearchFolder[];
 	key: string;
 }> {
+	const useGitRepoRoot = config.get<boolean>("searchGitRepoRoot", true);
 	const active = vscode.window.activeTextEditor?.document.uri;
-	if (active?.scheme === "file") {
-		const gitRoot = await findGitRoot(active);
+	// The active editor itself may be a non-file view (e.g. an `oil:` directory
+	// buffer), which has no repo to walk up from; fall back to the last real
+	// file editor so focusing such a view doesn't silently drop back to the
+	// open workspace folders.
+	const gitRootSource =
+		active?.scheme === "file" ? active : lastActiveFileUri;
+	if (useGitRepoRoot && gitRootSource) {
+		const gitRoot = await findGitRoot(gitRootSource);
 		if (gitRoot) {
 			return {
 				folders: [{ name: basename(gitRoot.path), uri: gitRoot }],
@@ -927,6 +956,14 @@ function gitignoreToGlobs(
 		const dirOnly = line.endsWith("/");
 		line = withoutTrailingSlash;
 		if (!line) {
+			continue;
+		}
+
+		// `patternsToGlob` folds these into a `{a,b,c}` brace group, so a rule
+		// containing `,`, `{` or `}` (e.g. the common `*.py,cover`) would be split
+		// into bogus alternatives — `*.py,cover` becoming `*.py`, which hides every
+		// Python file. Skip such rules; the `ignore` matcher still applies them.
+		if (/[,{}]/.test(line)) {
 			continue;
 		}
 

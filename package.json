@@ -94,6 +94,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Also honor the paths you've already hidden via the built-in `files.exclude` and `search.exclude` settings, in addition to `#betterFileSearch.excludeGlobs#`."
+        },
+        "betterFileSearch.searchGitRepoRoot": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When the active file lives in a Git repository, root the search at that repository instead of the open workspace folders — even when the repo lies outside the workspace. Disable to always search the open workspace folders."
         }
       }
     }
