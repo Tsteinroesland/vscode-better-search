@@ -288,13 +288,15 @@ async function ensureFullCandidates(data: WorkspaceCache): Promise<void> {
  * meaningful saving when mapping tens of thousands of URIs. In a multi-root
  * workspace the folder name is prefixed, matching the built-in API's default.
  */
-function makeRelativize(
-	folders: SearchFolder[],
-): (uri: vscode.Uri) => string {
+function makeRelativize(folders: SearchFolder[]): (uri: vscode.Uri) => string {
 	const multi = folders.length > 1;
 	const entries = folders.map((f) => {
 		const path = f.uri.path;
-		return { name: f.name, path, prefix: path.endsWith("/") ? path : `${path}/` };
+		return {
+			name: f.name,
+			path,
+			prefix: path.endsWith("/") ? path : `${path}/`,
+		};
 	});
 	return (uri: vscode.Uri): string => {
 		const p = uri.path;
@@ -553,7 +555,6 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 
 	quickPick.onDidHide(() => {
 		activeToggleIgnored = undefined;
-		activeToggleScorer = undefined;
 		activeToggleGitRepoRoot = undefined;
 		vscode.commands.executeCommand(
 			"setContext",
@@ -685,8 +686,7 @@ async function resolveSearchBase(useGitRepoRoot: boolean): Promise<{
 	// buffer), which has no repo to walk up from; fall back to the last real
 	// file editor so focusing such a view doesn't silently drop back to the
 	// open workspace folders.
-	const gitRootSource =
-		active?.scheme === "file" ? active : lastActiveFileUri;
+	const gitRootSource = active?.scheme === "file" ? active : lastActiveFileUri;
 	if (useGitRepoRoot && gitRootSource) {
 		const gitRoot = await findGitRoot(gitRootSource);
 		if (gitRoot) {
@@ -835,9 +835,7 @@ type GitignoreMatcher = { dir: string; ig: ReturnType<typeof ignore> };
  * {@link collectGitignore}, which skips anything it can't read.
  */
 function rootGitignoreUris(folders: SearchFolder[]): vscode.Uri[] {
-	return folders.map((folder) =>
-		vscode.Uri.joinPath(folder.uri, ".gitignore"),
-	);
+	return folders.map((folder) => vscode.Uri.joinPath(folder.uri, ".gitignore"));
 }
 
 /**
