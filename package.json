@@ -32,10 +32,6 @@
         "title": "Better File Search: Toggle Gitignored Files"
       },
       {
-        "command": "betterFileSearch.toggleScorer",
-        "title": "Better File Search: Toggle Match Algorithm"
-      },
-      {
         "command": "betterFileSearch.toggleGitRepoRoot",
         "title": "Better File Search: Toggle Git Repo Root Scope"
       }
@@ -75,19 +71,6 @@
             "**/__pycache__/**"
           ],
           "markdownDescription": "Glob patterns to exclude from search. Patterns are matched against file paths relative to the workspace root (e.g. `**/.venv/**`)."
-        },
-        "betterFileSearch.matchAlgorithm": {
-          "type": "string",
-          "enum": [
-            "cosine",
-            "levvy"
-          ],
-          "enumDescriptions": [
-            "Character n-gram cosine similarity — length-normalized, well suited to file paths.",
-            "Levvy edit distance — rewards contiguous matches via a streak bonus."
-          ],
-          "default": "cosine",
-          "markdownDescription": "Which algorithm ranks results. Toggling with the toolbar button (or the *Toggle Match Algorithm* command) while a search is open updates this setting."
         },
         "betterFileSearch.showIgnoredFiles": {
           "type": "boolean",

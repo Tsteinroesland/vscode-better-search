@@ -1,6 +1,5 @@
 import ignore from "ignore";
 import * as vscode from "vscode";
-import { CosineScorer } from "./cosine";
 import { LevvyScorer } from "./levvy";
 
 /**
@@ -32,15 +31,6 @@ export function activate(context: vscode.ExtensionContext): void {
 		"betterFileSearch.toggleIgnored",
 		() => {
 			activeToggleIgnored?.();
-		},
-	);
-
-	// Triggered by the Ctrl+Alt+H keybinding (and the QuickPick button) while a
-	// search is open. Switches the active match algorithm.
-	const toggleScorerCommand = vscode.commands.registerCommand(
-		"betterFileSearch.toggleScorer",
-		() => {
-			activeToggleScorer?.();
 		},
 	);
 
@@ -101,7 +91,6 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(
 		searchCommand,
 		toggleCommand,
-		toggleScorerCommand,
 		toggleGitRepoRootCommand,
 		watcher,
 		editorTracker,
@@ -114,12 +103,6 @@ export function activate(context: vscode.ExtensionContext): void {
  * running QuickPick without threading state through global commands.
  */
 let activeToggleIgnored: (() => void | Promise<void>) | undefined;
-
-/**
- * Toggle callback for switching the active match algorithm of the currently
- * open search, or `undefined` when no search is active.
- */
-let activeToggleScorer: (() => void) | undefined;
 
 /**
  * Toggle callback for switching the currently open search between the Git repo
@@ -402,10 +385,6 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	// better). The user can switch between them via the toolbar button or the
 	// Ctrl+Alt+H keybinding.
 	const levvyScorer = new LevvyScorer();
-	const cosineScorer = new CosineScorer();
-	// Seeded from the persisted preference; toggling updates the setting so the
-	// choice is remembered across opens and restarts.
-	let useCosine = config.get<string>("matchAlgorithm", "cosine") !== "levvy";
 
 	// How much the filename matters versus the full path when blending scores.
 	const filenameWeight = Math.min(
@@ -413,33 +392,15 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 		Math.max(0, config.get<number>("filenameWeight", 0.6)),
 	);
 
-	// A length-normalized match distance in a comparable range across scorers, so
-	// the filename and full-path passes can be blended. Cosine is already
-	// length-independent in [0, 1]; Levvy returns a raw edit cost, so we divide by
-	// the haystack length to get a per-character cost.
+	// A length-normalized match distance; Levvy returns a raw edit cost, so we
+	// divide by the haystack length to get a per-character cost.
 	const distance = (q: string, h: string): number =>
-		useCosine
-			? cosineScorer.score(q, h)
-			: levvyScorer.score(q, h) / Math.max(1, h.length);
-
-	const scorerName = () => (useCosine ? "Cosine similarity" : "Levvy distance");
-	const otherScorerName = () =>
-		useCosine ? "Levvy distance" : "Cosine similarity";
+		levvyScorer.score(q, h) / Math.max(1, h.length);
 
 	const ignoredButton: vscode.QuickInputButton = {
 		iconPath: new vscode.ThemeIcon("list-filter"),
 		tooltip: "Toggle gitignored files (Ctrl+H)",
 	};
-	// Rebuilt whenever the algorithm changes so its tooltip reflects the active
-	// scorer and what toggling switches to. Reassigning keeps the reference used
-	// for identity comparison in the button handler in sync.
-	let scorerButton: vscode.QuickInputButton = buildScorerButton();
-	function buildScorerButton(): vscode.QuickInputButton {
-		return {
-			iconPath: new vscode.ThemeIcon("arrow-swap"),
-			tooltip: `Match algorithm: ${scorerName()} — switch to ${otherScorerName()} (Ctrl+Alt+H)`,
-		};
-	}
 	// Rebuilt whenever the scope changes so its tooltip reflects the active base.
 	let gitRootButton: vscode.QuickInputButton = buildGitRootButton();
 	function buildGitRootButton(): vscode.QuickInputButton {
@@ -451,22 +412,23 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 		};
 	}
 	const refreshButtons = () => {
-		scorerButton = buildScorerButton();
 		gitRootButton = buildGitRootButton();
-		quickPick.buttons = [scorerButton, gitRootButton, ignoredButton];
+		quickPick.buttons = [gitRootButton, ignoredButton];
 	};
 	// The candidate list is ready; drop the loading spinner.
 	quickPick.busy = false;
 
 	const updateTitle = () => {
-		const parts: string[] = [scorerName()];
+		const parts: string[] = [];
 		if (includeIgnored) {
 			parts.push("gitignored shown");
 		}
 		if (!useGitRepoRoot) {
 			parts.push("workspace scope");
 		}
-		quickPick.title = `Better File Search (${parts.join(", ")})`;
+		quickPick.title = parts.length
+			? `Better File Search (${parts.join(", ")})`
+			: "Better File Search";
 		refreshButtons();
 	};
 
@@ -527,18 +489,6 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 		rank(quickPick.value);
 	};
 
-	const toggleScorer = () => {
-		useCosine = !useCosine;
-		// Persist the choice so future searches open with the same algorithm.
-		void config.update(
-			"matchAlgorithm",
-			useCosine ? "cosine" : "levvy",
-			vscode.ConfigurationTarget.Global,
-		);
-		updateTitle();
-		rank(quickPick.value);
-	};
-
 	const toggleGitRepoRoot = async () => {
 		useGitRepoRoot = !useGitRepoRoot;
 		// Persist the choice so future searches open with the same scope.
@@ -577,8 +527,6 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	quickPick.onDidTriggerButton((button) => {
 		if (button === ignoredButton) {
 			toggleIgnored();
-		} else if (button === scorerButton) {
-			toggleScorer();
 		} else if (button === gitRootButton) {
 			toggleGitRepoRoot();
 		}
@@ -596,7 +544,6 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	// Expose the toggle and mark the search as active so the Ctrl+H keybinding
 	// (gated on the `betterFileSearch.searchActive` context) can reach it.
 	activeToggleIgnored = toggleIgnored;
-	activeToggleScorer = toggleScorer;
 	activeToggleGitRepoRoot = toggleGitRepoRoot;
 	vscode.commands.executeCommand(
 		"setContext",
