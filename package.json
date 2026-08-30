@@ -34,6 +34,10 @@
       {
         "command": "betterFileSearch.toggleScorer",
         "title": "Better File Search: Toggle Match Algorithm"
+      },
+      {
+        "command": "betterFileSearch.toggleGitRepoRoot",
+        "title": "Better File Search: Toggle Git Repo Root Scope"
       }
     ],
     "keybindings": [
@@ -98,7 +102,7 @@
         "betterFileSearch.searchGitRepoRoot": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "When the active file lives in a Git repository, root the search at that repository instead of the open workspace folders — even when the repo lies outside the workspace. Disable to always search the open workspace folders."
+          "markdownDescription": "When the active file lives in a Git repository, root the search at that repository instead of the open workspace folders — even when the repo lies outside the workspace. Disable to always search the open workspace folders. Toggling with the toolbar button (or the *Toggle Git Repo Root Scope* command) while a search is open updates this setting."
         }
       }
     }

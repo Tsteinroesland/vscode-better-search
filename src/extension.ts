@@ -44,6 +44,15 @@ export function activate(context: vscode.ExtensionContext): void {
 		},
 	);
 
+	// Switches the active search between the Git repo root and the open workspace
+	// folders. Forwards to the active search's toggle, if any.
+	const toggleGitRepoRootCommand = vscode.commands.registerCommand(
+		"betterFileSearch.toggleGitRepoRoot",
+		() => {
+			activeToggleGitRepoRoot?.();
+		},
+	);
+
 	// Invalidate the candidate cache when files are added/removed or a .gitignore
 	// changes, so a reopened search reflects the current tree. Pure content edits
 	// don't change the set of paths, so they're ignored; churn inside gitignored
@@ -93,6 +102,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		searchCommand,
 		toggleCommand,
 		toggleScorerCommand,
+		toggleGitRepoRootCommand,
 		watcher,
 		editorTracker,
 	);
@@ -110,6 +120,12 @@ let activeToggleIgnored: (() => void | Promise<void>) | undefined;
  * open search, or `undefined` when no search is active.
  */
 let activeToggleScorer: (() => void) | undefined;
+
+/**
+ * Toggle callback for switching the currently open search between the Git repo
+ * root and the open workspace folders, or `undefined` when no search is active.
+ */
+let activeToggleGitRepoRoot: (() => void | Promise<void>) | undefined;
 
 /**
  * The most recently active editor whose document has the `file` scheme. Used
@@ -335,18 +351,21 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 
 	// The search is rooted at the active file's Git repository when it has one
 	// and `searchGitRepoRoot` is enabled, otherwise at the open workspace folders
-	// (see `resolveSearchBase`).
-	const base = await resolveSearchBase(config);
+	// (see `resolveSearchBase`). Toggleable while the search is open.
+	// Seeded from the persisted preference; toggling updates the setting so the
+	// choice is remembered across opens and restarts.
+	let useGitRepoRoot = config.get<boolean>("searchGitRepoRoot", true);
+	const base = await resolveSearchBase(useGitRepoRoot);
 
 	// Candidate enumeration is cached per base across opens and invalidated by the
 	// file watcher (see `activate`). A warm cache makes reopening near-instant; a
 	// cold one pays for a single walk of the base.
-	const data = await ensureCache(config, base);
+	let data = await ensureCache(config, base);
 
 	// Recently opened files, most-recent-first, resolved directly from disk so
 	// they surface even when gitignored (and therefore skipped by the walk).
 	// Merged into the candidate list below rather than shown as a separate group.
-	const recentCandidates = await resolveRecentCandidates(
+	let recentCandidates = await resolveRecentCandidates(
 		recentFiles,
 		data.folders,
 		data.relativize,
@@ -421,9 +440,20 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 			tooltip: `Match algorithm: ${scorerName()} — switch to ${otherScorerName()} (Ctrl+Alt+H)`,
 		};
 	}
+	// Rebuilt whenever the scope changes so its tooltip reflects the active base.
+	let gitRootButton: vscode.QuickInputButton = buildGitRootButton();
+	function buildGitRootButton(): vscode.QuickInputButton {
+		return {
+			iconPath: new vscode.ThemeIcon(useGitRepoRoot ? "repo" : "root-folder"),
+			tooltip: useGitRepoRoot
+				? "Scope: Git repository — switch to workspace folders"
+				: "Scope: workspace folders — switch to Git repository",
+		};
+	}
 	const refreshButtons = () => {
 		scorerButton = buildScorerButton();
-		quickPick.buttons = [scorerButton, ignoredButton];
+		gitRootButton = buildGitRootButton();
+		quickPick.buttons = [scorerButton, gitRootButton, ignoredButton];
 	};
 	// The candidate list is ready; drop the loading spinner.
 	quickPick.busy = false;
@@ -432,6 +462,9 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 		const parts: string[] = [scorerName()];
 		if (includeIgnored) {
 			parts.push("gitignored shown");
+		}
+		if (!useGitRepoRoot) {
+			parts.push("workspace scope");
 		}
 		quickPick.title = `Better File Search (${parts.join(", ")})`;
 		refreshButtons();
@@ -506,6 +539,38 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 		rank(quickPick.value);
 	};
 
+	const toggleGitRepoRoot = async () => {
+		useGitRepoRoot = !useGitRepoRoot;
+		// Persist the choice so future searches open with the same scope.
+		void config.update(
+			"searchGitRepoRoot",
+			useGitRepoRoot,
+			vscode.ConfigurationTarget.Global,
+		);
+		quickPick.busy = true;
+		try {
+			// A different base means a different candidate set; the per-base cache
+			// makes toggling back and forth cheap after the first walk of each.
+			data = await ensureCache(config, await resolveSearchBase(useGitRepoRoot));
+			if (includeIgnored && !data.fullLoaded) {
+				await ensureFullCandidates(data);
+			}
+			recentCandidates = await resolveRecentCandidates(
+				recentFiles,
+				data.folders,
+				data.relativize,
+			);
+			activeCandidates = mergeRecent(
+				includeIgnored ? data.candidates : data.visible,
+				recentCandidates,
+			);
+		} finally {
+			quickPick.busy = false;
+		}
+		updateTitle();
+		rank(quickPick.value);
+	};
+
 	rank("");
 	updateTitle();
 	quickPick.onDidChangeValue(rank);
@@ -514,6 +579,8 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 			toggleIgnored();
 		} else if (button === scorerButton) {
 			toggleScorer();
+		} else if (button === gitRootButton) {
+			toggleGitRepoRoot();
 		}
 	});
 
@@ -530,6 +597,7 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	// (gated on the `betterFileSearch.searchActive` context) can reach it.
 	activeToggleIgnored = toggleIgnored;
 	activeToggleScorer = toggleScorer;
+	activeToggleGitRepoRoot = toggleGitRepoRoot;
 	vscode.commands.executeCommand(
 		"setContext",
 		"betterFileSearch.searchActive",
@@ -539,6 +607,7 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	quickPick.onDidHide(() => {
 		activeToggleIgnored = undefined;
 		activeToggleScorer = undefined;
+		activeToggleGitRepoRoot = undefined;
 		vscode.commands.executeCommand(
 			"setContext",
 			"betterFileSearch.searchActive",
@@ -651,22 +720,19 @@ async function findGitRoot(
 }
 
 /**
- * Chooses the folders the search enumerates. When `betterFileSearch.searchGitRepoRoot`
- * is enabled and the active editor's file lives in a Git repository, the search
- * is rooted at that repository — even when it lies outside the open workspace —
- * so results are scoped to the repo you're working in. Otherwise it falls back
- * to the open workspace folders.
+ * Chooses the folders the search enumerates. When `useGitRepoRoot` is set and
+ * the active editor's file lives in a Git repository, the search is rooted at
+ * that repository — even when it lies outside the open workspace — so results
+ * are scoped to the repo you're working in. Otherwise it falls back to the open
+ * workspace folders.
  *
  * The `key` uniquely identifies the base so the candidate cache can hold a
  * separate entry per repo/workspace and reuse it when you return to one.
  */
-async function resolveSearchBase(
-	config: vscode.WorkspaceConfiguration,
-): Promise<{
+async function resolveSearchBase(useGitRepoRoot: boolean): Promise<{
 	folders: SearchFolder[];
 	key: string;
 }> {
-	const useGitRepoRoot = config.get<boolean>("searchGitRepoRoot", true);
 	const active = vscode.window.activeTextEditor?.document.uri;
 	// The active editor itself may be a non-file view (e.g. an `oil:` directory
 	// buffer), which has no repo to walk up from; fall back to the last real

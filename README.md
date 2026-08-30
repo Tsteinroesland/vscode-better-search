@@ -46,9 +46,10 @@ which you can reference in your own keybindings:
 | ------------------------------- | ----------------------------------------- |
 | `betterFileSearch.searchActive` | the Better File Search quick pick is open |
 
-The `Toggle Gitignored Files` and `Toggle Match Algorithm` commands ship without
-a default keybinding. To bind one that only fires while the picker is open — so
-the same key still does its normal job elsewhere — gate it on the context key:
+The `Toggle Gitignored Files`, `Toggle Match Algorithm` and `Toggle Git Repo Root
+Scope` commands ship without a default keybinding. To bind one that only fires
+while the picker is open — so the same key still does its normal job elsewhere —
+gate it on the context key:
 
 ```json
 {
