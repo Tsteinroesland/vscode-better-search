@@ -53,10 +53,10 @@
         },
         "betterFileSearch.filenameWeight": {
           "type": "number",
-          "default": 0.6,
+          "default": 0.3,
           "minimum": 0,
           "maximum": 1,
-          "markdownDescription": "How much the file *name* matters versus the full *path* when ranking. `1` ranks purely by filename, `0` purely by path; the default `0.6` leans toward the filename while still rewarding folder matches."
+          "markdownDescription": "Penalty for the part of a match that falls in the *directory* rather than the file *name*. `0` ranks purely by full path; `1` ranks purely by filename. The default `0.3` prefers files whose name matches while still letting a typed folder path rank its contents first."
         },
         "betterFileSearch.excludeGlobs": {
           "type": "array",

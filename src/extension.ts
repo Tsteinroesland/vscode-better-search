@@ -1,6 +1,6 @@
 import ignore from "ignore";
 import * as vscode from "vscode";
-import { LevvyScorer } from "./levvy";
+import { LevvyScorer, skip_cost } from "./levvy";
 
 /**
  * Called when the extension is activated. The first time the user runs one of
@@ -388,16 +388,20 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	// Ctrl+Alt+H keybinding.
 	const levvyScorer = new LevvyScorer();
 
-	// How much the filename matters versus the full path when blending scores.
+	// Penalty weight for match quality that lives in the directory part rather
+	// than the basename (see `rankCandidates`).
 	const filenameWeight = Math.min(
 		1,
-		Math.max(0, config.get<number>("filenameWeight", 0.6)),
+		Math.max(0, config.get<number>("filenameWeight", 0.3)),
 	);
 
-	// A length-normalized match distance; Levvy returns a raw edit cost, so we
-	// divide by the haystack length to get a per-character cost.
+	// Length-neutral match distance. Levvy charges `skip_cost` per unmatched
+	// haystack char, so a raw score grows with `h.length` regardless of match
+	// quality. Subtracting that baseline is equivalent to padding every candidate
+	// to a common length (as tarshtein-distance does), leaving only the quality
+	// of the match itself; path length is handled by the tie-break in ranking.
 	const distance = (q: string, h: string): number =>
-		levvyScorer.score(q, h) / Math.max(1, h.length);
+		levvyScorer.score(q, h) - skip_cost * h.length;
 
 	const ignoredButton: vscode.QuickInputButton = {
 		iconPath: new vscode.ThemeIcon("list-filter"),
@@ -441,9 +445,12 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 		alwaysShow: true,
 	});
 
-	// Orders candidates by match quality for the given query. Blends a filename
-	// pass with a full-path pass so the name dominates but folder text still
-	// counts; lower is better. On ties, the shorter path wins.
+	// Orders candidates by match quality for the given query; lower is better.
+	// The full-path distance is the base score. Since `relPath` ends with `name`,
+	// `nameD >= pathD` always, and the gap is exactly the match quality that
+	// only the directory part provides — a fraction of it is added as a penalty
+	// so basename matches rank ahead of equally good folder matches. On ties,
+	// the shorter path wins.
 	const rankCandidates = (query: string, list: Candidate[]): Candidate[] =>
 		list
 			.map((c) => {
@@ -451,7 +458,7 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 				const pathD = distance(query, c.relPath);
 				return {
 					c,
-					score: filenameWeight * nameD + (1 - filenameWeight) * pathD,
+					score: pathD + filenameWeight * (nameD - pathD),
 				};
 			})
 			.sort(

@@ -1,5 +1,5 @@
 const del_cost = 2
-const skip_cost = 2
+export const skip_cost = 2
 const sub_cost = 3
 const streak_bias = 3
 
