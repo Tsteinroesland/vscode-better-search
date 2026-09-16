@@ -362,9 +362,10 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 		return;
 	}
 
-	// Files matched by .gitignore are hidden by default, mirroring VS Code's own
-	// Quick Open (which honors `search.useIgnoreFiles`). The user can toggle them
-	// in via Ctrl+H while the search is open.
+	// Files matched by .gitignore, and dotfiles/dot-directories, are hidden by
+	// default, mirroring VS Code's own Quick Open (which honors
+	// `search.useIgnoreFiles`). The user can toggle them in via Ctrl+H while the
+	// search is open.
 	// Seeded from the persisted preference; toggling updates the setting so the
 	// choice is remembered across opens and restarts.
 	let includeIgnored = config.get<boolean>("showIgnoredFiles", false);
@@ -405,7 +406,7 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 
 	const ignoredButton: vscode.QuickInputButton = {
 		iconPath: new vscode.ThemeIcon("list-filter"),
-		tooltip: "Toggle gitignored files (Ctrl+H)",
+		tooltip: "Toggle hidden & gitignored files (Ctrl+H)",
 	};
 	// Rebuilt whenever the scope changes so its tooltip reflects the active base.
 	let gitRootButton: vscode.QuickInputButton = buildGitRootButton();
@@ -427,7 +428,7 @@ async function searchFiles(recentFiles: RecentFiles): Promise<void> {
 	const updateTitle = () => {
 		const parts: string[] = [];
 		if (includeIgnored) {
-			parts.push("gitignored shown");
+			parts.push("hidden & gitignored shown");
 		}
 		if (!useGitRepoRoot) {
 			parts.push("workspace scope");
@@ -908,11 +909,11 @@ async function collectGitignore(
 function buildIsIgnored(
 	matchers: GitignoreMatcher[],
 ): (relPath: string) => boolean {
-	if (matchers.length === 0) {
-		return () => false;
-	}
 	return (relPath: string): boolean => {
 		const path = relPath.replace(/\\/g, "/");
+		if (isHiddenPath(path)) {
+			return true;
+		}
 		for (const { dir, ig } of matchers) {
 			let sub: string;
 			if (dir === "") {
@@ -928,6 +929,11 @@ function buildIsIgnored(
 		}
 		return false;
 	};
+}
+
+/** Whether any segment of a `/`-separated path is a dotfile or dot-directory. */
+function isHiddenPath(path: string): boolean {
+	return path.startsWith(".") || path.includes("/.");
 }
 
 /**
